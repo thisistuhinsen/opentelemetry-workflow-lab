@@ -129,6 +129,7 @@ def prepare_envoy(workspace, directory):
     target = directory / "envoy.tmpl.yaml"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text.replace(marker, route + marker, 1), encoding="utf-8", newline="\n")
+    target.chmod(0o644)  # Public config consumed by the non-root proxy.
     return target
 
 
@@ -138,6 +139,22 @@ def write_json(path, value):
         json.dump(value, stream, indent=2)
         stream.write("\n")
     path.chmod(0o600)
+
+
+def verify_bind_sources(config):
+    for service in config["services"].values():
+        for mount in service.get("volumes", []):
+            if mount.get("type") != "bind":
+                continue
+            source = Path(mount["source"])
+            if not source.exists():
+                raise ValueError("A required public bind input is absent: " + str(source))
+            if os.name != "nt":
+                required = 0o005 if source.is_dir() else 0o004
+                if source.stat().st_mode & required != required:
+                    raise ValueError(
+                        "A public bind input is not readable by its non-root container: " + str(source)
+                    )
 
 
 def native(argv, source=None):
@@ -1136,6 +1153,8 @@ def dispatch_main(argv=None, runner=native, http=request):
         if "emitRawPii" in flags["flags"]:
             flags["flags"]["emitRawPii"]["defaultVariant"] = "off"
         write_json(directory / "flags/demo.flagd.json", flags)
+        (directory / "flags").chmod(0o755)
+        (directory / "flags/demo.flagd.json").chmod(0o644)  # Synthetic public flags, not private state.
         envoy_template = prepare_envoy(workspace, directory)
         telemetry = (
             (_RECORDER.root / "telemetry" / project) if _RECORDER is not None else directory / "telemetry"
@@ -1155,6 +1174,7 @@ def dispatch_main(argv=None, runner=native, http=request):
                 telemetry,
             ),
         )
+        verify_bind_sources(json.loads((directory / "compose.json").read_bytes()))
         runner(
             [
                 "docker",

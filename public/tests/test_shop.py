@@ -5,16 +5,56 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 PUBLIC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PUBLIC))
 
 
 class ShopControls(unittest.TestCase):
+    def test_setup_makes_only_public_mounted_flags_guest_readable(self):
+        shop = self.module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = self.state_fixture(shop, root)
+            runner, http, _, _ = self.adapters(shop)
+            fresh = root / "fresh"
+            calls = []
+            real_chmod = Path.chmod
+
+            def chmod(path, mode, *args, **kwargs):
+                calls.append((path, mode))
+                return real_chmod(path, mode, *args, **kwargs)
+
+            with mock.patch.object(Path, "chmod", new=chmod), contextlib.redirect_stdout(io.StringIO()):
+                shop.main(
+                    [
+                        "--state-dir",
+                        str(fresh),
+                        "setup",
+                        "--workspace",
+                        state["workspace"],
+                        "--images",
+                        state["images_lock"],
+                        "--context",
+                        state["docker_context"],
+                    ],
+                    runner,
+                    http,
+                )
+            self.assertIn((fresh / "flags/demo.flagd.json", 0o644), calls)
+            self.assertIn((fresh / "flags", 0o755), calls)
+            self.assertIn((fresh / "envoy.tmpl.yaml", 0o644), calls)
+            self.assertIn((fresh / "state.json", 0o600), calls)
+            if os.name != "nt":
+                self.assertEqual((fresh / "flags/demo.flagd.json").stat().st_mode & 0o777, 0o644)
+                self.assertEqual((fresh / "state.json").stat().st_mode & 0o777, 0o600)
+
     def module(self):
         spec = importlib.util.spec_from_file_location("sample_shop", PUBLIC / "shop.py")
         self.assertIsNotNone(spec)
