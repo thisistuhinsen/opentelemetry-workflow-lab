@@ -1,0 +1,887 @@
+"""Exercise the public case catalog through the launcher; retain host evidence.
+
+This script is intended for an isolated Linux CI runner. It never prunes Docker
+or removes resources directly: stop/clean use the launcher's recorded namespaces.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PUBLIC = Path(__file__).resolve().parent
+ROOT = PUBLIC.parent
+
+
+def timestamp():
+    return dt.datetime.now(dt.UTC).isoformat()
+
+
+def read_json(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def file_binding(root, path):
+    if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()):
+        raise ValueError("Evidence inventory refuses redirected files.")
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+            size += len(chunk)
+    return {"path": path.relative_to(root).as_posix(), "bytes": size, "sha256": digest.hexdigest()}
+
+
+def closed_primary_inventory(evidence):
+    """Freeze closed primary runs, never the live companion or shared viewer."""
+    files, excluded = [], []
+    for path in sorted((evidence / "runs").glob("*/run.json")):
+        record = read_json(path)
+        if (
+            record.get("command") == "Live service logs"
+            or record.get("status") == "running"
+            or not record.get("finished_at")
+        ):
+            excluded.append(path.relative_to(evidence).as_posix())
+            continue
+        if any(command.get("status") == "running" for command in record.get("commands", [])):
+            raise RuntimeError("A closed primary run still has an active native command.")
+        # Include native logs and any captured input/result files in this closed
+        # run; telemetry, index.html, and CI cleanup logs live outside it.
+        files.extend(
+            file_binding(evidence, item) for item in sorted(path.parent.rglob("*")) if item.is_file()
+        )
+    return {"files": files, "excluded_active_or_companion_runs": excluded}
+
+
+def _unique_json(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("Duplicate OTLP JSON field.")
+        value[key] = item
+    return value
+
+
+def parse_otlp_traces(path):
+    """Validate actual file-exporter envelopes, not debug text or log records."""
+    counts = {}
+    lines = 0
+    with path.open("r", encoding="utf-8", errors="strict") as stream:
+        for line in stream:
+            lines += 1
+            record = json.loads(line, object_pairs_hook=_unique_json)
+            resources = record.get("resourceSpans") if isinstance(record, dict) else None
+            if not isinstance(resources, list) or not resources:
+                raise ValueError("Missing nonempty OTLP resourceSpans.")
+            for resource in resources:
+                if not isinstance(resource, dict):
+                    raise ValueError("Malformed OTLP resource.")
+                metadata = resource.get("resource")
+                if not isinstance(metadata, dict):
+                    raise ValueError("Missing OTLP resource metadata.")
+                attributes = metadata.get("attributes", [])
+                if not isinstance(attributes, list) or any(not isinstance(item, dict) for item in attributes):
+                    raise ValueError("Malformed OTLP resource attributes.")
+                service_attributes = [item for item in attributes if item.get("key") == "service.name"]
+                if len(service_attributes) != 1 or not isinstance(service_attributes[0].get("value"), dict):
+                    raise ValueError("OTLP resource requires exactly one service.name attribute.")
+                names = [service_attributes[0]["value"].get("stringValue")]
+                if len(names) != 1 or not isinstance(names[0], str) or not names[0].strip():
+                    raise ValueError("OTLP resource requires exactly one service.name.")
+                scopes = resource.get("scopeSpans")
+                if not isinstance(scopes, list) or not scopes:
+                    raise ValueError("Missing nonempty OTLP scopeSpans.")
+                for scope in scopes:
+                    spans = scope.get("spans") if isinstance(scope, dict) else None
+                    if not isinstance(spans, list) or not spans:
+                        raise ValueError("Missing nonempty OTLP spans.")
+                    for span in spans:
+                        if (
+                            not isinstance(span, dict)
+                            or not isinstance(span.get("name"), str)
+                            or not span["name"].strip()
+                        ):
+                            raise ValueError("Malformed OTLP span name.")
+                        for key, length in (("traceId", 32), ("spanId", 16)):
+                            identifier = span.get(key)
+                            if (
+                                not isinstance(identifier, str)
+                                or not re.fullmatch(r"[0-9a-fA-F]{" + str(length) + "}", identifier)
+                                or int(identifier, 16) == 0
+                            ):
+                                raise ValueError("Malformed OTLP span identity.")
+                        start, end = span.get("startTimeUnixNano"), span.get("endTimeUnixNano")
+                        if any(
+                            type(value) not in (int, str) or not re.fullmatch(r"[0-9]+", str(value))
+                            for value in (start, end)
+                        ):
+                            raise ValueError("Malformed OTLP span timestamps.")
+                        if not 0 < int(start) <= int(end) < 2**64:
+                            raise ValueError("Invalid OTLP span timestamp order.")
+                        counts[names[0]] = counts.get(names[0], 0) + 1
+    if not lines or not counts:
+        raise ValueError("No exported OTLP spans.")
+    return {
+        "observed_span_count": sum(counts.values()),
+        "service_counts": dict(sorted(counts.items())),
+        "jsonl_lines": lines,
+    }
+
+
+def telemetry_inventory(evidence, projects):
+    records, files = [], []
+    for context, project in projects:
+        directory = evidence / "telemetry" / project
+        path = directory / "traces.jsonl"
+        row = {"project": project, "docker_context": context, "status": "UNKNOWN"}
+        try:
+            row.update(file_binding(evidence, path))
+            row.update(parse_otlp_traces(path))
+            row["status"] = "OBSERVED_EXPORTED_SPANS"
+        except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+            row["error"] = "Missing, empty, malformed, or redirected OTLP file; no trace qualification."
+        records.append(row)
+        if directory.exists():
+            files.extend(
+                file_binding(evidence, item) for item in sorted(directory.rglob("*")) if item.is_file()
+            )
+    return {
+        "status": "PASS"
+        if records and all(row["status"] == "OBSERVED_EXPORTED_SPANS" for row in records)
+        else "NO_RECORDED_PROJECTS"
+        if not records
+        else "FAILED",
+        "projects": records,
+        "files": files,
+        "basis": "stopped file-exporter JSONL; debug logs are not substitutes",
+    }
+
+
+def scan_runtime_privacy(evidence):
+    """Inspect persisted bytes and JSON ASCII escapes, with no raw-value output."""
+    needles = {"default_pan": b"4111111111111111", "default_email": b"shopper@example.test"}
+    scanned, excluded, violations, errors = 0, [], [], []
+    for path in sorted(evidence.rglob("*")):
+        relative = path.relative_to(evidence)
+        # Launcher source is represented by hashes, not copied bodies. No
+        # directory name can exempt runtime bytes from the upload scan.
+        try:
+            if path.is_symlink() or not path.resolve().is_relative_to(evidence.resolve()):
+                raise ValueError("Redirected evidence")
+            if not path.is_file():
+                continue
+            scanned += 1
+            found = {
+                label
+                for label, needle in needles.items()
+                if needle in relative.as_posix().encode("utf-8").lower()
+            }
+            carry = b""
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    combined = carry + chunk
+                    normalized = re.sub(
+                        rb"\\u00([0-9a-fA-F]{2})", lambda match: bytes([int(match[1], 16)]), combined
+                    ).lower()
+                    found.update(label for label, needle in needles.items() if needle in normalized)
+                    carry = combined[-256:]
+            if found:
+                violations.append({"path": relative.as_posix(), "sentinels": sorted(found)})
+        except (OSError, ValueError):
+            errors.append(relative.as_posix())
+    return {
+        "status": "PASS_DEFAULT_SENTINELS" if not violations and not errors else "FAILED",
+        "scanned_files": scanned,
+        "files_with_matches": len(violations),
+        "violations": violations,
+        "unreadable_or_redirected": errors,
+        "excluded_tool_source_files": excluded,
+        "scope": "default synthetic PAN/email in persisted bytes and JSON ASCII escapes; no general PII guarantee",
+    }
+
+
+def privacy_check(evidence):
+    result = scan_runtime_privacy(evidence)
+    write_json(evidence / "ci" / "privacy-final.json", result)
+    summary = {
+        "status": result["status"],
+        "scanned_files": result["scanned_files"],
+        "files_with_matches": result["files_with_matches"],
+        "unreadable_files": len(result["unreadable_or_redirected"]),
+        "excluded_tool_source_files": len(result["excluded_tool_source_files"]),
+        "scope": "Default synthetic PAN/email sentinel scan only; not general PII certification.",
+    }
+    write_json(evidence / "ci" / "privacy-summary.json", summary)
+    allowed = result["status"] == "PASS_DEFAULT_SENTINELS"
+    if os.environ.get("GITHUB_OUTPUT"):
+        with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
+            stream.write("allowed=" + ("true" if allowed else "false") + "\n")
+    return 0 if allowed else 1
+
+
+def verify_inventory(evidence, before):
+    rows, changes = [], []
+    for old in before["files"]:
+        try:
+            current = file_binding(evidence, evidence / old["path"])
+        except (OSError, ValueError):
+            current = {"path": old["path"], "status": "MISSING_OR_UNREADABLE"}
+        rows.append(current)
+        if current != old:
+            changes.append(old["path"])
+    return {"files": rows, "changed": changes, "unchanged": not changes}
+
+
+def recorded_projects(base):
+    projects = set()
+    for path in [base / "state.json", *sorted((base / "worlds").glob("*/state.json"))]:
+        if not path.exists():
+            continue
+        if path.is_symlink() or not path.resolve().is_relative_to(base.resolve()):
+            raise ValueError("A recorded shop escapes its CI state folder.")
+        record = read_json(path)
+        context, project = record.get("docker_context", ""), record.get("project", "")
+        if not re.fullmatch(r"shop-[0-9a-f]{12}", project) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", context
+        ):
+            raise ValueError("Recorded cleanup requires an exact sample namespace and captured context.")
+        projects.add((context, project))
+    return sorted(projects)
+
+
+def running_census(projects, run=subprocess.run):
+    rows = []
+    for context, project in projects:
+        argv = [
+            "docker",
+            "--context",
+            context,
+            "ps",
+            "--filter",
+            "label=com.docker.compose.project=" + project,
+            "--format",
+            "{{.ID}}",
+        ]
+        result = run(argv, text=True, capture_output=True, check=False, timeout=30)
+        ids = result.stdout.split()
+        valid = result.returncode == 0 and all(re.fullmatch(r"[0-9a-f]{12,64}", item) for item in ids)
+        rows.append(
+            {
+                "docker_context": context,
+                "project": project,
+                "argv": argv,
+                "exit_code": result.returncode,
+                "running_ids": ids if valid else None,
+                "status": "ZERO" if valid and not ids else "NONZERO" if valid else "UNKNOWN",
+            }
+        )
+    return {
+        "scope": "recorded sample projects only",
+        "projects": rows,
+        "status": "ZERO"
+        if rows and all(row["status"] == "ZERO" for row in rows)
+        else "NO_RECORDED_PROJECTS"
+        if not rows
+        else "FAILED",
+    }
+
+
+def required_refs(lock):
+    services = lock.get("services")
+    if not isinstance(services, dict) or not services:
+        raise ValueError("The runtime image lock has no service references.")
+    refs = sorted(set(services.values()))
+    if not all(
+        isinstance(ref, str) and re.fullmatch(r"[a-z0-9./_-]+@sha256:[0-9a-f]{64}", ref) for ref in refs
+    ):
+        raise ValueError("Cold inventory requires immutable registry image references.")
+    return refs
+
+
+def cold_status(rows):
+    present = sum(row["status"] == "PRESENT" for row in rows)
+    missing = sum(row["status"] == "ABSENT" for row in rows)
+    if not rows or present + missing != len(rows):
+        return "UNKNOWN"
+    return (
+        "REQUIRED_IMAGES_COLD"
+        if not present
+        else "REQUIRED_IMAGES_PARTIALLY_CACHED"
+        if missing
+        else "REQUIRED_IMAGES_CACHED"
+    )
+
+
+def cold_census(context, lock, destination, run=subprocess.run):
+    """Inspect only required refs, before setup/start can pull or build anything."""
+    record = {
+        "schema": "workflow-lab.ci-image-census.v1",
+        "started_utc": timestamp(),
+        "docker_context": context,
+        "scope": "required immutable images only; not a global engine census",
+        "images": [],
+        "status": "UNKNOWN",
+    }
+    try:
+        for ref in required_refs(lock):
+            result = run(
+                ["docker", "--context", context, "image", "inspect", "--format", "{{.Id}}", ref],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode == 0 and re.fullmatch(r"sha256:[0-9a-f]{64}", result.stdout.strip()):
+                row = {"ref": ref, "status": "PRESENT", "config_id": result.stdout.strip()}
+            elif result.returncode != 0 and "no such image" in result.stderr.lower():
+                row = {"ref": ref, "status": "ABSENT"}
+            else:
+                raise RuntimeError("Required-image inspection failed; cold state is unknown.")
+            record["images"].append(row)
+        record["status"] = cold_status(record["images"])
+        return record
+    finally:
+        record["completed_utc"] = timestamp()
+        write_json(destination, record)
+
+
+def active_state(base):
+    directory = base
+    if (base / "active.json").is_file():
+        directory = base / read_json(base / "active.json")["world"]
+    if not directory.resolve().is_relative_to(base.resolve()):
+        raise ValueError("The active shop record escapes the selected CI folder.")
+    return read_json(directory / "state.json")
+
+
+def assert_fresh(before, after, context, *, empty=False):
+    if before["project"] == after["project"] or after["docker_context"] != context:
+        raise RuntimeError("Reset/replay did not preserve context and create a fresh shop.")
+    if empty and after.get("users"):
+        raise RuntimeError("Reset unexpectedly recorded a shopper action.")
+    if set(before.get("users", {})) & set(after.get("users", {})):
+        raise RuntimeError("Replay reused a previous shopper.")
+
+
+class Campaign:
+    def __init__(self, state, evidence):
+        self.state = state.resolve()
+        self.evidence = evidence.resolve()
+        if self.evidence.is_relative_to(self.state) or self.state.is_relative_to(self.evidence):
+            raise ValueError("CI state and durable evidence must be separate folders.")
+        self.receipts = self.evidence / "ci"
+        self.receipts.mkdir(parents=True, exist_ok=True)
+        self.sequence = len(list(self.receipts.glob("command-*.json")))
+
+    def cli(self, *arguments):
+        self.sequence += 1
+        stem = "command-" + str(self.sequence).zfill(3)
+        argv = [
+            sys.executable,
+            str(PUBLIC / "shop.py"),
+            "--no-browser",
+            "--state-dir",
+            str(self.state),
+            "--evidence-dir",
+            str(self.evidence),
+            *arguments,
+        ]
+        record = {"argv": argv, "started_utc": timestamp(), "exit_code": None, "log": stem + ".log"}
+        start = time.monotonic()
+        print("Shop CI: " + " ".join(arguments), flush=True)
+        try:
+            with (self.receipts / record["log"]).open("wb") as log:
+                result = subprocess.run(
+                    argv,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                    env={**os.environ, "CI": "true", "PYTHONUNBUFFERED": "1"},
+                )
+            record["exit_code"] = result.returncode
+            if result.returncode:
+                raise RuntimeError("Shop step failed: " + " ".join(arguments) + "; inspect " + record["log"])
+        finally:
+            record.update(completed_utc=timestamp(), duration_seconds=time.monotonic() - start)
+            write_json(self.receipts / (stem + ".json"), record)
+
+    def action(self, command, story):
+        runs = self.evidence / "runs"
+        prior = set(runs.glob("*/run.json"))
+        self.cli(*command)
+        new = {
+            path
+            for path in set(runs.glob("*/run.json")) - prior
+            if read_json(path).get("command") == command[0]
+        }
+        # The live service-log companion is a separate recorder, not the CLI
+        # result. Still reject missing or duplicate matching primary runs.
+        if len(new) != 1:
+            raise RuntimeError("The story did not produce exactly one durable CLI run.")
+        run_path = new.pop()
+        record = read_json(run_path)
+        result_path = run_path.parent / "result.json"
+        result = read_json(result_path)
+        if (
+            record.get("status") != "passed"
+            or result.get("story") != story
+            or result.get("assessment", {}).get("passed") is not True
+        ):
+            raise RuntimeError("The durable story assessment did not pass.")
+        return {
+            "story": story,
+            "command": command,
+            "run": str(run_path.relative_to(self.evidence)),
+            "run_sha256": sha256(run_path),
+            "result_sha256": sha256(result_path),
+            "assessment": result["assessment"],
+        }
+
+    def cleanup(self):
+        failures = []
+        attempt = "cleanup-" + str(len(list(self.receipts.glob("cleanup-*.json"))) + 1).zfill(3)
+        before = None
+        census = {"status": "UNKNOWN"}
+        telemetry = {"status": "UNKNOWN"}
+        projects = []
+        try:
+            projects = recorded_projects(self.state)
+            self.cli("stop")
+            before = closed_primary_inventory(self.evidence)
+            telemetry = telemetry_inventory(self.evidence, projects)
+            before["files"].extend(telemetry["files"])
+            write_json(self.receipts / (attempt + "-before.json"), before)
+            write_json(self.receipts / (attempt + "-telemetry.json"), telemetry)
+            if telemetry["status"] not in ("PASS", "NO_RECORDED_PROJECTS"):
+                failures.append("Every recorded project requires valid nonempty exported OTLP spans.")
+        except (OSError, ValueError, RuntimeError) as error:
+            failures.append(str(error))
+        try:
+            self.cli("clean")
+        except (OSError, ValueError, RuntimeError) as error:
+            failures.append(str(error))
+        if before is not None:
+            after = verify_inventory(self.evidence, before)
+            write_json(self.receipts / (attempt + "-after.json"), after)
+            if not after["unchanged"]:
+                failures.append("Closed primary evidence changed during cleanup.")
+        try:
+            census = running_census(projects)
+            if census["status"] not in ("ZERO", "NO_RECORDED_PROJECTS"):
+                failures.append("Recorded shop running-container census was not zero.")
+        except (OSError, subprocess.SubprocessError) as error:
+            failures.append(str(error))
+        privacy = scan_runtime_privacy(self.evidence)
+        write_json(self.receipts / (attempt + "-privacy.json"), privacy)
+        write_json(self.receipts / "privacy-final.json", privacy)
+        if privacy["status"] != "PASS_DEFAULT_SENTINELS":
+            failures.append("Persisted evidence failed the default synthetic PAN/email scan.")
+        record = {
+            "completed_utc": timestamp(),
+            "status": "FAILED" if failures else "COMPLETED",
+            "errors": failures,
+            "evidence_retained": self.evidence.is_dir(),
+            "scope": "recorded sample namespaces only",
+            "primary_inventory_status": "UNCHANGED"
+            if before is not None and not after["changed"]
+            else "UNKNOWN_OR_CHANGED",
+            "running_census": census,
+            "telemetry_status": telemetry["status"],
+            "privacy_status": privacy["status"],
+        }
+        write_json(self.receipts / (attempt + ".json"), record)
+        write_json(self.receipts / "cleanup.json", record)
+        return not failures
+
+
+def self_test():
+    """Run inert regressions; no Docker, network, or shop actions are executed."""
+    import tempfile
+    import unittest
+    from unittest import mock
+
+    module = sys.modules[__name__]
+
+    class Controls(unittest.TestCase):
+        def setUp(self):
+            self.temp = tempfile.TemporaryDirectory()
+            self.addCleanup(self.temp.cleanup)
+            self.base = Path(self.temp.name)
+            self.campaign = Campaign(self.base / "state", self.base / "evidence")
+
+        def primary(self, name="primary", command="story", passed=True):
+            directory = self.campaign.evidence / "runs" / name
+            write_json(
+                directory / "run.json",
+                {"command": command, "status": "passed", "finished_at": timestamp(), "commands": []},
+            )
+            write_json(
+                directory / "result.json", {"story": "normal-checkout", "assessment": {"passed": passed}}
+            )
+            return directory
+
+        def test_companion_coexists_with_one_matching_primary(self):
+            def cli(*args):
+                self.primary()
+                self.primary("companion", "Live service logs")
+
+            self.campaign.cli = cli
+            self.assertEqual(
+                self.campaign.action(["story", "normal-checkout"], "normal-checkout")["story"],
+                "normal-checkout",
+            )
+
+        def test_duplicate_matching_primaries_reject(self):
+            self.campaign.cli = lambda *args: (self.primary(), self.primary("duplicate"))
+            with self.assertRaises(RuntimeError):
+                self.campaign.action(["story", "normal-checkout"], "normal-checkout")
+
+        def test_failed_assessment_is_not_promoted_by_companion(self):
+            self.campaign.cli = lambda *args: (
+                self.primary(passed=False),
+                self.primary("companion", "Live service logs"),
+            )
+            with self.assertRaises(RuntimeError):
+                self.campaign.action(["story", "normal-checkout"], "normal-checkout")
+
+        def test_inventory_excludes_companion_and_detects_primary_change(self):
+            primary = self.primary()
+            command = primary / "commands" / "001.stdin.json"
+            command.parent.mkdir()
+            command.write_bytes(b'{"synthetic":true}')
+            (primary / "commands" / "001.stdout.log").write_bytes(b"closed output")
+            companion = self.primary("companion", "Live service logs")
+            before = closed_primary_inventory(self.campaign.evidence)
+            paths = {row["path"] for row in before["files"]}
+            self.assertIn("runs/primary/commands/001.stdin.json", paths)
+            self.assertFalse(any("companion" in path for path in paths))
+            (companion / "result.json").write_bytes(b"still growing")
+            self.assertTrue(verify_inventory(self.campaign.evidence, before)["unchanged"])
+            command.write_bytes(b"changed input")
+            self.assertFalse(verify_inventory(self.campaign.evidence, before)["unchanged"])
+
+        def test_census_is_context_and_exact_project_scoped(self):
+            calls = []
+
+            def run(argv, **kwargs):
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            project = "shop-" + "a" * 12
+            result = running_census([("captured-context", project)], run)
+            self.assertEqual(result["status"], "ZERO")
+            self.assertEqual(calls[0][:4], ["docker", "--context", "captured-context", "ps"])
+            self.assertIn("label=com.docker.compose.project=" + project, calls[0])
+            for code, output, expected in ((0, "a" * 12, "NONZERO"), (1, "", "UNKNOWN")):
+                result = running_census(
+                    [("captured-context", project)],
+                    lambda *a, **k: subprocess.CompletedProcess(a, code, output, ""),
+                )
+                self.assertEqual(result["projects"][0]["status"], expected)
+
+        def test_cleanup_stops_before_freeze_and_preserves_original_files(self):
+            events = []
+            self.primary()
+
+            def cli(command):
+                events.append(command)
+                if command == "clean":
+                    self.assertTrue(list(self.campaign.receipts.glob("cleanup-*-before.json")))
+
+            self.campaign.cli = cli
+            with mock.patch.object(module, "running_census", return_value={"status": "ZERO"}) as census:
+                self.assertTrue(self.campaign.cleanup())
+                self.assertEqual(census.call_count, 1)
+            self.assertEqual(events, ["stop", "clean"])
+            self.assertEqual(
+                read_json(self.campaign.receipts / "cleanup.json")["primary_inventory_status"], "UNCHANGED"
+            )
+
+        def test_cleanup_changed_primary_or_running_container_fails(self):
+            primary = self.primary()
+            self.campaign.cli = lambda command: (
+                (primary / "result.json").write_text("changed") if command == "clean" else None
+            )
+            with mock.patch.object(module, "running_census", return_value={"status": "FAILED"}):
+                self.assertFalse(self.campaign.cleanup())
+            record = read_json(self.campaign.receipts / "cleanup.json")
+            self.assertEqual(record["status"], "FAILED")
+            self.assertEqual(len(record["errors"]), 2)
+
+        def test_invalid_recorded_namespace_rejects(self):
+            write_json(
+                self.campaign.state / "state.json", {"project": "unrelated", "docker_context": "captured"}
+            )
+            with self.assertRaises(ValueError):
+                recorded_projects(self.campaign.state)
+
+        def test_zero_exported_spans_cannot_pass_cleanup(self):
+            project = "shop-" + "b" * 12
+            write_json(self.campaign.state / "state.json", {"project": project, "docker_context": "captured"})
+            traces = self.campaign.evidence / "telemetry" / project / "traces.jsonl"
+            traces.parent.mkdir(parents=True)
+            traces.write_bytes(b"")
+            self.campaign.cli = lambda command: None
+            with mock.patch.object(module, "running_census", return_value={"status": "ZERO"}):
+                self.assertFalse(self.campaign.cleanup())
+
+        def trace(self):
+            project = "shop-" + "c" * 12
+            write_json(self.campaign.state / "state.json", {"project": project, "docker_context": "captured"})
+            span = {
+                "name": "GET /api/products",
+                "traceId": "1" * 32,
+                "spanId": "2" * 16,
+                "startTimeUnixNano": "100",
+                "endTimeUnixNano": "200",
+            }
+            record = {
+                "resourceSpans": [
+                    {
+                        "resource": {
+                            "attributes": [{"key": "service.name", "value": {"stringValue": "frontend"}}]
+                        },
+                        "scopeSpans": [{"spans": [span]}],
+                    }
+                ]
+            }
+            path = self.campaign.evidence / "telemetry" / project / "traces.jsonl"
+            write_json(path, record)
+            path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            return path, record
+
+        def test_actual_otlp_file_binds_span_service_count_and_hash(self):
+            path, record = self.trace()
+            path.write_text(json.dumps(record) + "\n" + json.dumps(record) + "\n", encoding="utf-8")
+            result = telemetry_inventory(self.campaign.evidence, recorded_projects(self.campaign.state))
+            self.assertEqual(result["status"], "PASS")
+            row = result["projects"][0]
+            self.assertEqual(row["observed_span_count"], 2)
+            self.assertEqual(row["service_counts"], {"frontend": 2})
+            self.assertEqual(row["sha256"], sha256(path))
+            self.assertEqual(row["bytes"], path.stat().st_size)
+
+        def test_debug_empty_malformed_and_invalid_span_lines_reject(self):
+            path, record = self.trace()
+            invalid_span = json.loads(json.dumps(record))
+            invalid_span["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["spanId"] = "0" * 16
+            missing_service = json.loads(json.dumps(record))
+            missing_service["resourceSpans"][0]["resource"]["attributes"] = []
+            for data in (
+                b"",
+                b"debug: Spans #1 service.name=frontend\n",
+                b'{"resourceSpans":[]}\n',
+                (json.dumps(record) + "\nnot-json\n").encode(),
+                b"\xff\n",
+                (json.dumps(invalid_span) + "\n").encode(),
+                (json.dumps(missing_service) + "\n").encode(),
+            ):
+                with self.subTest(data=data[:30]):
+                    path.write_bytes(data)
+                    self.assertEqual(
+                        telemetry_inventory(self.campaign.evidence, recorded_projects(self.campaign.state))[
+                            "status"
+                        ],
+                        "FAILED",
+                    )
+
+        def test_one_good_project_cannot_hide_another_empty_project(self):
+            self.trace()
+            project = "shop-" + "d" * 12
+            write_json(
+                self.campaign.state / "worlds" / "other" / "state.json",
+                {"project": project, "docker_context": "captured"},
+            )
+            result = telemetry_inventory(self.campaign.evidence, recorded_projects(self.campaign.state))
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(len(result["projects"]), 2)
+
+        def test_closed_telemetry_must_survive_cleanup_unchanged(self):
+            path, _ = self.trace()
+            self.campaign.cli = lambda command: None
+            with mock.patch.object(module, "running_census", return_value={"status": "ZERO"}):
+                self.assertTrue(self.campaign.cleanup())
+            before = read_json(next(self.campaign.receipts.glob("cleanup-*-before.json")))
+            self.assertIn(
+                path.relative_to(self.campaign.evidence).as_posix(), {row["path"] for row in before["files"]}
+            )
+            self.campaign.cli = lambda command: path.write_bytes(b"changed") if command == "clean" else None
+            with mock.patch.object(module, "running_census", return_value={"status": "ZERO"}):
+                self.assertFalse(self.campaign.cleanup())
+
+        def test_privacy_scans_logs_results_inputs_and_json_escapes(self):
+            for relative, data in (
+                ("runs/live/commands/out.log", b"4111111111111111"),
+                ("runs/case/result.json", b"shopper@example.test"),
+                ("runs/case/inputs/compose.json", b"4111111111111111"),
+                ("telemetry/project/traces.jsonl", b"\\u0034" + b"111111111111111"),
+            ):
+                path = self.campaign.evidence / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+            result = scan_runtime_privacy(self.campaign.evidence)
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(result["files_with_matches"], 4)
+            self.assertNotIn("4111111111111111", json.dumps(result))
+
+        def test_privacy_scans_even_source_named_paths(self):
+            path = self.campaign.evidence / "runs" / "id" / "inputs" / "tool-source" / "shop.py"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"4111111111111111 shopper@example.test")
+            self.assertEqual(scan_runtime_privacy(self.campaign.evidence)["status"], "FAILED")
+            self.assertEqual(scan_runtime_privacy(self.campaign.evidence)["files_with_matches"], 1)
+            log = self.campaign.evidence / "runtime.log"
+            log.write_bytes(b"x" * (1024 * 1024 - 4) + b"4111111111111111")
+            self.assertEqual(scan_runtime_privacy(self.campaign.evidence)["status"], "FAILED")
+
+        def test_privacy_upload_output_is_fail_closed_and_summary_minimized(self):
+            path = self.campaign.evidence / "runtime.log"
+            path.write_bytes(b"shopper@example.test")
+            output = self.base / "github-output"
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+                self.assertEqual(privacy_check(self.campaign.evidence), 1)
+            self.assertEqual(output.read_text(), "allowed=false\n")
+            summary = (self.campaign.receipts / "privacy-summary.json").read_bytes()
+            self.assertNotIn(b"shopper@example.test", summary)
+            self.assertNotIn(b"runtime.log", summary)
+
+        def test_privacy_upload_allowed_only_after_clean_scan(self):
+            (self.campaign.evidence / "runtime.log").write_bytes(
+                b"synthetic runtime result, no forbidden values"
+            )
+            output = self.base / "github-output"
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+                self.assertEqual(privacy_check(self.campaign.evidence), 0)
+            self.assertEqual(output.read_text(), "allowed=true\n")
+
+        def test_redirected_runtime_evidence_cannot_pass_privacy(self):
+            target = self.base / "outside.log"
+            target.write_bytes(b"outside")
+            try:
+                (self.campaign.evidence / "redirect.log").symlink_to(target)
+            except OSError as error:
+                self.skipTest("Host cannot create inert symlink: " + str(error))
+            self.assertEqual(scan_runtime_privacy(self.campaign.evidence)["status"], "FAILED")
+
+    result = unittest.TextTestRunner(verbosity=2).run(
+        unittest.defaultTestLoader.loadTestsFromTestCase(Controls)
+    )
+    return 0 if result.wasSuccessful() else 1
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--state-dir", type=Path, default=ROOT / ".ci-shop")
+    parser.add_argument("--evidence-dir", type=Path, default=ROOT / "evidence")
+    parser.add_argument("--context", help="Pin a Docker context; otherwise capture it once before inventory.")
+    parser.add_argument(
+        "--cleanup", action="store_true", help="Only stop/clean recorded CI shops; retain evidence."
+    )
+    parser.add_argument(
+        "--self-test", action="store_true", help="Run inert CI orchestration regressions only."
+    )
+    parser.add_argument(
+        "--privacy-check",
+        "--privacy-only",
+        dest="privacy_check",
+        action="store_true",
+        help="Scan persisted evidence and emit fail-closed GitHub upload eligibility; no Docker.",
+    )
+    args = parser.parse_args(argv)
+    if args.self_test:
+        return self_test()
+    if args.privacy_check:
+        evidence = args.evidence_dir.resolve()
+        if not evidence.is_dir():
+            return 1
+        return privacy_check(evidence)
+    campaign = Campaign(args.state_dir, args.evidence_dir)
+    if args.cleanup:
+        return 0 if campaign.cleanup() else 1
+    summary = {
+        "schema": "workflow-lab.ci-campaign.v1",
+        "started_utc": timestamp(),
+        "status": "RUNNING",
+        "story_results": [],
+        "runtime_scope": "public sample observations only",
+    }
+    success = False
+    try:
+        if (campaign.state / "state.json").exists() or (campaign.state / "active.json").exists():
+            raise ValueError(
+                "This CI state folder already contains a shop; do not replay an unfinished campaign."
+            )
+        catalog = read_json(PUBLIC / "stories.json")["stories"]
+        if not catalog or any(not re.fullmatch(r"[a-z][a-z0-9-]*", name) for name in catalog):
+            raise ValueError("The public story catalog is empty or malformed.")
+        summary.update(
+            stories=list(catalog),
+            catalog_sha256=sha256(PUBLIC / "stories.json"),
+            runtime_lock_sha256=sha256(PUBLIC / "runtime-images.lock.json"),
+            disk_free_bytes=shutil.disk_usage(ROOT).free,
+        )
+        context = args.context
+        if not context:
+            context = subprocess.run(
+                ["docker", "context", "show"], text=True, capture_output=True, check=True
+            ).stdout.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", context):
+            raise ValueError("Docker context name is invalid.")
+        summary["docker_context"] = context
+        cold_census(
+            context,
+            read_json(PUBLIC / "runtime-images.lock.json"),
+            campaign.receipts / "required-image-cold-census.json",
+        )
+        campaign.cli("setup", "--context", context)
+        campaign.cli("start", next(iter(catalog)))
+        for story in catalog:
+            summary["story_results"].append(campaign.action(["story", story], story))
+            previous = active_state(campaign.state)
+            campaign.cli("reset")
+            reset = active_state(campaign.state)
+            assert_fresh(previous, reset, context, empty=True)
+            summary["story_results"].append(campaign.action(["replay"], story))
+            replay = active_state(campaign.state)
+            assert_fresh(reset, replay, context)
+            if set(previous.get("users", {})) & set(replay.get("users", {})):
+                raise RuntimeError("Explicit replay reused the first story shopper.")
+            write_json(campaign.receipts / "campaign.json", summary)
+        success = True
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+        summary["error"] = str(error)
+        print("Shop CI stopped: " + str(error), file=sys.stderr)
+    finally:
+        cleaned = campaign.cleanup()
+        summary.update(
+            status="PASSED" if success and cleaned else "FAILED",
+            completed_utc=timestamp(),
+            cleanup_completed=cleaned,
+        )
+        write_json(campaign.receipts / "campaign.json", summary)
+    return 0 if success and cleaned else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

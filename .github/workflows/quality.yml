@@ -1,0 +1,71 @@
+name: Source and Docker checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sample-checks-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out sample
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+        with:
+          version: "0.11.6"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Create durable host evidence folder
+        run: |
+          mkdir -p evidence/ci
+          python3 -c 'import datetime,json,pathlib; pathlib.Path("evidence/ci/workflow-start.json").write_text(json.dumps({"started_utc":datetime.datetime.now(datetime.timezone.utc).isoformat(),"runtime_status":"NOT_RUN"})+"\n")'
+      - name: Test launcher and source acquisition controls
+        run: uv run --no-project --python 3.12 python -m unittest discover -s public/tests -v
+      - name: Check Python source and formatting
+        run: |
+          uvx --from ruff==0.17.0 ruff check public
+          uvx --from ruff==0.17.0 ruff format --check public
+      - name: Compile sample scripts
+        run: uv run --no-project --python 3.12 python -m compileall -q public
+      - name: Test CI evidence selection and cleanup controls without Docker
+        run: uv run --no-project --python 3.12 python public/ci_smoke.py --self-test
+      - name: Check documented project-local wrapper
+        run: ./shop --no-browser cases
+      - name: Run every catalog story, fresh reset, and explicit replay
+        run: uv run --no-project --python 3.12 python public/ci_smoke.py
+      - name: Preserve stop on failure
+        if: always()
+        run: uv run --no-project --python 3.12 python public/ci_smoke.py --cleanup
+      - name: Check persisted runtime privacy before upload
+        id: privacy
+        if: always()
+        run: uv run --no-project --python 3.12 python public/ci_smoke.py --privacy-check
+      - name: Upload durable evidence and visual run viewer
+        if: always() && steps.privacy.outputs.allowed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: workflow-lab-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload minimized privacy summary when full evidence is withheld
+        if: always() && steps.privacy.outputs.allowed != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: workflow-lab-privacy-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/ci/privacy-summary.json
+          if-no-files-found: warn
+          retention-days: 14

@@ -1,0 +1,41 @@
+{
+  "schema": "workflow-lab.stories.v1",
+  "stories": {
+    "normal-checkout": {
+      "title": "Normal checkout",
+      "description": "Buy one item and verify that the cart is cleared.",
+      "action": "checkout",
+      "source_variant": "original",
+      "cartFailure": "off",
+      "paymentUnreachable": "off",
+      "expected": "success-empty"
+    },
+    "cart-failure": {
+      "title": "Cart fails to clear",
+      "description": "Observe a successful order response while the deliberately failing cart retains its item. This fault can take a few minutes.",
+      "action": "checkout",
+      "source_variant": "original",
+      "cartFailure": "100%",
+      "paymentUnreachable": "off",
+      "expected": "success-retained"
+    },
+    "payment-unreachable": {
+      "title": "Payment is unavailable",
+      "description": "Observe an error response and a retained cart when the simulated payment service is unavailable.",
+      "action": "checkout",
+      "source_variant": "original",
+      "cartFailure": "off",
+      "paymentUnreachable": "on",
+      "expected": "error-retained"
+    },
+    "mcp-session-id": {
+      "title": "MCP reads the right cart",
+      "description": "Add an item through HTTP, then verify the corrected MCP tool reads the same shopper cart.",
+      "action": "mcp-cart",
+      "source_variant": "mcp-session-id",
+      "cartFailure": "off",
+      "paymentUnreachable": "off",
+      "expected": "matching-cart"
+    }
+  }
+}

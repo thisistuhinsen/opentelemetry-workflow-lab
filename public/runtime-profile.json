@@ -1,0 +1,19 @@
+{
+  "schema": "workflow-lab.runtime-profile.v1",
+  "memory_floor_mib": {
+    "astronomy-db": 192,
+    "checkout": 96,
+    "currency": 64,
+    "product-catalog": 64,
+    "payment": 256,
+    "quote": 128,
+    "shipping": 64,
+    "valkey-cart": 64
+  },
+  "startup_wait_seconds": 600,
+  "native_timeout_seconds": 900,
+  "checkout_http_seconds": 420,
+  "read_http_seconds": 90,
+  "proxy_checkout_seconds": 360,
+  "proxy_idle_seconds": 480
+}

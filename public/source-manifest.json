@@ -1,0 +1,36 @@
+{
+  "schema": "opentelemetry-sample-source.v1",
+  "upstream": {
+    "url": "https://github.com/open-telemetry/opentelemetry-demo.git",
+    "commit": "2c4be61741536937f1486ecaf74f44dbfd15d707",
+    "license": "Apache-2.0"
+  },
+  "default_variant": "original",
+  "variants": {
+    "original": {
+      "base_commit": "2c4be61741536937f1486ecaf74f44dbfd15d707",
+      "patches": []
+    },
+    "mcp-session-id": {
+      "base_commit": "2c4be61741536937f1486ecaf74f44dbfd15d707",
+      "patches": [
+        {
+          "file": "patches/mcp-session-id.patch",
+          "sha256": "a92da937de411c9e81b79ec75fdb86147994d7740e3c8f772eea5ae75c9ff276",
+          "expected_files": {
+            "src/shared/tools.py": "179d31d39921f933eaf498b932ba54d075db9f8213730675095cfe012a003273",
+            "src/shared/test_tools.py": "96dc1853cf49244b02a06923369b377bfe1c6ea65f4f7f6dcda1d4115e4fbfb0"
+          }
+        }
+      ],
+      "changed_public_paths": [
+        "src/shared/tools.py",
+        "src/shared/test_tools.py"
+      ]
+    }
+  },
+  "runtime": "IMPLEMENTED_RUNTIME_VERIFICATION_PENDING",
+  "cold_reconstruction": "NOT_RUN",
+  "registry_publication": "NOT_RUN",
+  "worktree_byte_policy": "CANONICAL_GIT_BLOB_BYTES_PER_COMMAND_AUTOCRLF_FALSE_EOL_LF"
+}

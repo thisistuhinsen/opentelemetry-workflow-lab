@@ -1,0 +1,1349 @@
+"""Small source-first Astronomy Shop CLI using native Docker Compose."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import hashlib
+import http.client
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+try:
+    from .source_integrity import verify_source
+except ImportError:
+    from source_integrity import verify_source
+
+PUBLIC = Path(__file__).resolve().parent
+CORE_SERVICES = (
+    "ad",
+    "astronomy-db",
+    "cart",
+    "checkout",
+    "currency",
+    "email",
+    "flagd",
+    "frontend",
+    "frontend-proxy",
+    "image-provider",
+    "mcp",
+    "otel-collector",
+    "payment",
+    "product-catalog",
+    "quote",
+    "recommendation",
+    "shipping",
+    "valkey-cart",
+)
+STORIES = json.loads((PUBLIC / "stories.json").read_bytes())["stories"]
+PROFILE = json.loads((PUBLIC / "runtime-profile.json").read_bytes())
+for _name, _story in STORIES.items():
+    if (
+        not re.fullmatch(r"[a-z][a-z0-9-]*", _name)
+        or _story.get("action") not in ("checkout", "mcp-cart")
+        or _story.get("source_variant") not in ("original", "mcp-session-id")
+    ):
+        raise ValueError("Story catalog contains an unsupported name, action or source variant.")
+_RECORDER = None
+SOURCE_COMMIT = "2c4be61741536937f1486ecaf74f44dbfd15d707"
+BASE_IMAGES = json.loads((PUBLIC / "runtime-images.lock.json").read_bytes())["services"]
+APPLICATION_PROVENANCE = json.loads((PUBLIC / "images.lock.json").read_bytes())
+if any(
+    entry["source_commit"] != SOURCE_COMMIT
+    or entry["platform"] != "linux/amd64"
+    or BASE_IMAGES.get(entry["service"]) != entry["reference"]
+    for entry in APPLICATION_PROVENANCE["images"]
+) or {entry["service"] for entry in APPLICATION_PROVENANCE["images"]} != set(CORE_SERVICES) - {
+    "flagd",
+    "valkey-cart",
+    "astronomy-db",
+    "otel-collector",
+}:
+    raise ValueError("Shipped image references and upstream application provenance are inconsistent.")
+
+
+def progress(message, **metadata):
+    print(message, flush=True)
+    if _RECORDER is not None:
+        _RECORDER.phase(message, **metadata)
+
+
+def assess_story(story, outcome):
+    expected = STORIES[story]["expected"]
+    before = outcome.get("cart_before", outcome.get("HTTP_cart", []))
+    after = outcome.get("cart_after", outcome.get("MCP_cart", []))
+    positive = (
+        len(before) == 1
+        and type(before[0].get("quantity")) is int
+        and before[0]["quantity"] == 1
+        and isinstance(before[0].get("product_id"), str)
+        and bool(before[0]["product_id"])
+    )
+    code = outcome.get("checkout_HTTP_status", 0)
+    if expected == "success-empty":
+        passed = positive and code == 200 and outcome.get("order_response_present") is True and after == []
+    elif expected == "success-retained":
+        passed = (
+            positive and code == 200 and outcome.get("order_response_present") is True and after == before
+        )
+    elif expected == "error-retained":
+        passed = (
+            positive
+            and isinstance(code, int)
+            and 400 <= code <= 599
+            and not outcome.get("order_response_present")
+            and after == before
+        )
+    elif expected == "matching-cart":
+        passed = (
+            positive
+            and outcome.get("MCP_initialized") is True
+            and outcome.get("tool_error") is False
+            and outcome.get("projections_match") is True
+            and after == before
+        )
+    else:
+        raise ValueError("Story expected outcome is unsupported.")
+    passed = passed and outcome.get("cart_HTTP_status") == 200
+    return {"passed": bool(passed), "expected": expected, "description": STORIES[story]["description"]}
+
+
+def prepare_envoy(workspace, directory):
+    text = (workspace / "src/frontend-proxy/envoy.tmpl.yaml").read_text(encoding="utf-8")
+    marker = '                        - match: { prefix: "/" }'
+    if text.count(marker) != 1:
+        raise ValueError("The pinned public proxy template has an unexpected route layout.")
+    route = (
+        '                        - match: { path: "/api/checkout" }\n'
+        f"                          route: {{ cluster: frontend, timeout: {PROFILE['proxy_checkout_seconds']}s, idle_timeout: {PROFILE['proxy_idle_seconds']}s }}\n"
+    )
+    target = directory / "envoy.tmpl.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text.replace(marker, route + marker, 1), encoding="utf-8", newline="\n")
+    return target
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\n") as stream:
+        json.dump(value, stream, indent=2)
+        stream.write("\n")
+    path.chmod(0o600)
+
+
+def native(argv, source=None):
+    from processes import run_native
+
+    return run_native(argv, source, recorder=_RECORDER, timeout=PROFILE["native_timeout_seconds"])
+
+
+def load_image_lock(path, variant, *, allow_pending=False):
+    lock = json.loads(path.read_bytes())
+    accepted = {"QUALIFIED"} | ({"SUPPORT_QUALIFICATION_PENDING"} if allow_pending else set())
+    if lock.get("status") not in accepted or lock.get("source_variant") != variant:
+        raise ValueError("Image lock is not yet qualified for this source variant; runtime is disabled.")
+    if lock.get("source_commit") != SOURCE_COMMIT or lock.get("platform") != "linux/amd64":
+        raise ValueError("Image lock does not bind the supported source and platform.")
+    images = lock.get("services", {})
+    if set(images) != set(CORE_SERVICES):
+        raise ValueError("Qualified lock must cover the exact public core service set.")
+    for name, value in images.items():
+        if not (name == "mcp" and variant == "mcp-session-id") and value != BASE_IMAGES[name]:
+            raise ValueError(
+                "Image lock changed a qualified upstream reference; this sample cannot qualify custom images."
+            )
+        if (
+            not (name == "mcp" and variant == "mcp-session-id")
+            and isinstance(value, str)
+            and re.fullmatch(r"[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}", value)
+        ):
+            continue
+        proof = lock.get("public_mcp_derivation", {})
+        if (
+            name == "mcp"
+            and variant == "mcp-session-id"
+            and isinstance(value, str)
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", value)
+            and proof.get("status") == "LOCAL_PUBLIC_BUILD"
+            and proof.get("image_id") == value
+            and proof.get("base_reference")
+            == "ghcr.io/open-telemetry/demo@sha256:8cea957d3930d9df7365c0d655835bf3d553d097eae80d4428dac40b29ef533c"
+            and proof.get("patch_sha256")
+            == "a92da937de411c9e81b79ec75fdb86147994d7740e3c8f772eea5ae75c9ff276"
+            and proof.get("patched_tools_sha256")
+            == "179d31d39921f933eaf498b932ba54d075db9f8213730675095cfe012a003273"
+        ):
+            continue
+        raise ValueError(
+            "Use immutable registry digests; only the explicitly qualified public MCP derivation may use a local immutable ID."
+        )
+    return images
+
+
+MCP_BASE_REFERENCE = (
+    "ghcr.io/open-telemetry/demo@sha256:8cea957d3930d9df7365c0d655835bf3d553d097eae80d4428dac40b29ef533c"
+)
+MCP_TOOLS_SHA256 = "179d31d39921f933eaf498b932ba54d075db9f8213730675095cfe012a003273"
+
+
+def build_public_mcp(directory, workspace, context, runner=native):
+    source = workspace / "src/shared/tools.py"
+    data = source.read_bytes()
+    if hashlib.sha256(data).hexdigest() != MCP_TOOLS_SHA256:
+        raise ValueError(
+            "The public MCP source does not match the shipped query correction; no build was started."
+        )
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", context):
+        raise ValueError("Docker context name is invalid.")
+    build_context = directory / "mcp-image-inputs"
+    build_context.mkdir(parents=True, exist_ok=True)
+    recipe = (
+        "FROM " + MCP_BASE_REFERENCE + "\nCOPY src/shared/tools.py /app/src/mcp_server/tools.py\n"
+    ).encode()
+    files = {"Dockerfile": recipe, "src/shared/tools.py": data}
+    existing = list(build_context.rglob("*"))
+    if any(f.is_symlink() for f in existing) or any(
+        f.is_file() and f.relative_to(build_context).as_posix() not in files for f in existing
+    ):
+        raise ValueError("MCP build context contains an unexpected file; no build was started.")
+    for name, contents in files.items():
+        target = build_context / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() and target.read_bytes() != contents:
+            raise ValueError("MCP build input changed; no build was started.")
+        target.write_bytes(contents)
+    image_file = directory / "mcp-image-id.txt"
+    print("Preparing the public MCP cart-query correction...", flush=True)
+    runner(["docker", "--context", context, "pull", "--platform", "linux/amd64", MCP_BASE_REFERENCE])
+    runner(
+        [
+            "docker",
+            "--context",
+            context,
+            "build",
+            "--platform",
+            "linux/amd64",
+            "--network",
+            "none",
+            "--iidfile",
+            str(image_file),
+            str(build_context),
+        ]
+    )
+    identity = image_file.read_text().strip()
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", identity):
+        raise ValueError("Docker did not return an immutable MCP image identity.")
+    observed = runner(
+        ["docker", "--context", context, "image", "inspect", identity, "--format", "{{.Id}}"]
+    ).strip()
+    if observed != identity:
+        raise ValueError("The built MCP image does not match its recorded identity.")
+    proof = {
+        "status": "LOCAL_PUBLIC_BUILD",
+        "image_id": identity,
+        "base_reference": MCP_BASE_REFERENCE,
+        "patch_sha256": "a92da937de411c9e81b79ec75fdb86147994d7740e3c8f772eea5ae75c9ff276",
+        "patched_tools_sha256": MCP_TOOLS_SHA256,
+        "dockerfile_sha256": hashlib.sha256(recipe).hexdigest(),
+    }
+    write_json(directory / "mcp-build.json", proof)
+    return proof
+
+
+def compose_args(state, arguments):
+    if not re.fullmatch(r"shop-[0-9a-f]{12}", state.get("project", "")):
+        raise ValueError("Refusing a namespace not owned by this sample.")
+    context = state.get("docker_context", "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", context):
+        raise ValueError(
+            "A captured Docker context is required; it is never reselected for later operations."
+        )
+    return [
+        "docker",
+        "--context",
+        context,
+        "compose",
+        "--project-name",
+        state["project"],
+        "-f",
+        state["config"],
+        *arguments,
+    ]
+
+
+def apply_runtime_profile(config):
+    for name, service in config["services"].items():
+        service.pop("container_name", None)
+        service.pop("profiles", None)
+        service.get("deploy", {}).pop("placement", None)
+        floor = PROFILE["memory_floor_mib"].get(name)
+        if floor is not None:
+            if type(floor) is not int or floor <= 0:
+                raise ValueError("Runtime memory floors must be positive integer MiB values.")
+            limits = service.setdefault("deploy", {}).setdefault("resources", {}).setdefault("limits", {})
+            limits["memory"] = str(max(int(limits.get("memory", 0)), floor * 1024 * 1024))
+        if name == "payment":
+            # This is a local Compose lab: cloud metadata discovery has no
+            # useful result and also runs in the image's instrumented Node
+            # health-check child. Keep application tracing enabled.
+            service.setdefault("environment", {})["OTEL_NODE_RESOURCE_DETECTORS"] = "env,host,os,process"
+            if "healthcheck" in service:
+                service["healthcheck"]["timeout"] = "15s"
+    return config
+
+
+def routing_binding(state):
+    fields = (
+        "project",
+        "docker_context",
+        "engine_id",
+        "story",
+        "source_variant",
+        "http_port",
+        "mcp_port",
+        "config",
+        "workspace",
+        "images_lock",
+        "base_images_lock",
+        "evidence_root",
+        "telemetry_directory",
+    )
+    identity = json.dumps(
+        {key: state.get(key) for key in fields}, sort_keys=True, separators=(",", ":")
+    ).encode()
+    return {"sha256": hashlib.sha256(identity).hexdigest(), "bytes": len(identity)}
+
+
+def bound_inputs(state, directory):
+    files = {
+        "compose": Path(state["config"]),
+        "flags": directory / "flags/demo.flagd.json",
+        "proxy": directory / "envoy.tmpl.yaml",
+        "collector": PUBLIC / "collector.yaml",
+        "stories": PUBLIC / "stories.json",
+        "profile": PUBLIC / "runtime-profile.json",
+        "images": Path(state["images_lock"]),
+        "provenance": PUBLIC / "images.lock.json",
+    }
+    result = {
+        key: {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "bytes": path.stat().st_size}
+        for key, path in files.items()
+    }
+    result["routing"] = routing_binding(state)
+    return result
+
+
+def verify_control_target(state, directory, runner=native):
+    compose_args(state, [])
+    if state.get("input_bindings", {}).get("routing") != routing_binding(state):
+        raise ValueError("Stop/cleanup target identity changed; no Docker mutation was dispatched.")
+    config = Path(state["config"]).resolve()
+    if config != (directory / "compose.json").resolve():
+        raise ValueError("Stop/cleanup configuration escapes its recorded world.")
+    data = config.read_bytes()
+    expected = state["input_bindings"].get("compose")
+    if expected != {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}:
+        raise ValueError("Stop/cleanup configuration changed; no Docker mutation was dispatched.")
+    rendered = json.loads(data)
+    resources = [*rendered.get("volumes", {}).values(), *rendered.get("networks", {}).values()]
+    if rendered.get("name") != state["project"] or any(
+        value.get("external") or not str(value.get("name", "")).startswith(state["project"] + "_")
+        for value in resources
+    ):
+        raise ValueError("Stop/cleanup resources escape their recorded namespace.")
+    engine = runner(["docker", "--context", state["docker_context"], "info", "--format", "{{.ID}}"]).strip()
+    if not state.get("engine_id") or engine != state["engine_id"]:
+        raise ValueError("Stop/cleanup Docker engine changed or is unknown; no mutation was dispatched.")
+    return rendered
+
+
+def bind_world(state, directory):
+    receipt = verify_source(Path(state["workspace"]), state["source_variant"])
+    state["source_receipt_sha256"] = receipt["source_receipt_sha256"]
+    state["input_bindings"] = bound_inputs(state, directory)
+
+
+def verify_world(state, directory):
+    receipt = verify_source(Path(state["workspace"]), state["source_variant"])
+    if state.get("source_receipt_sha256") != receipt["source_receipt_sha256"] or state.get(
+        "input_bindings"
+    ) != bound_inputs(state, directory):
+        raise ValueError(
+            "Recorded source/configuration inputs changed; prepare a fresh shop. No case was dispatched."
+        )
+    return receipt
+
+
+def snapshot_runtime(state, directory, runner=native):
+    images = load_image_lock(Path(state["images_lock"]), state["source_variant"])
+    context = ["docker", "--context", state["docker_context"]]
+    engine = runner([*context, "info", "--format", "{{.ID}}"]).strip()
+    if not engine or state.get("engine_id", engine) != engine:
+        raise ValueError("The captured Docker context now resolves to a different or unknown engine.")
+    names = list(images)
+    inspected = [
+        json.loads(line)
+        for line in runner(
+            [
+                *context,
+                "image",
+                "inspect",
+                *[images[name] for name in names],
+                "--format",
+                '{"config_id":{{json .Id}},"repo_digests":{{json .RepoDigests}}}',
+            ]
+        ).splitlines()
+        if line.strip()
+    ]
+    if len(inspected) != len(names) or any(
+        not re.fullmatch(r"sha256:[0-9a-f]{64}", record.get("config_id", "")) for record in inspected
+    ):
+        raise ValueError("Runtime image census is incomplete.")
+    expected = {name: record["config_id"] for name, record in zip(names, inspected)}
+    identifiers = runner(compose_args(state, ["ps", "--all", "--quiet"])).split()
+    if len(identifiers) != len(CORE_SERVICES) or any(
+        not re.fullmatch(r"[0-9a-f]{12,64}", value) for value in identifiers
+    ):
+        raise ValueError("Runtime container census is incomplete.")
+    template = '{"container_id":{{json .Id}},"image_id":{{json .Image}},"configured_image":{{json .Config.Image}},"service":{{json (index .Config.Labels "com.docker.compose.service")}},"running":{{json .State.Running}},"oom_killed":{{json .State.OOMKilled}}}'
+    rows = [
+        json.loads(line)
+        for line in runner([*context, "inspect", *identifiers, "--format", template]).splitlines()
+        if line.strip()
+    ]
+    if {row["service"] for row in rows} != set(CORE_SERVICES) or any(
+        not row["running"]
+        or row["oom_killed"]
+        or row["image_id"] != expected[row["service"]]
+        or row["configured_image"] != images[row["service"]]
+        for row in rows
+    ):
+        raise ValueError("Actual containers do not match the selected public image closure.")
+    state["engine_id"] = engine
+    state["input_bindings"] = bound_inputs(state, directory)
+    write_json(directory / "state.json", state)
+    result = {
+        "engine_id": engine,
+        "docker_context": state["docker_context"],
+        "project": state["project"],
+        "containers": rows,
+        "images": {name: record for name, record in zip(names, inspected)},
+    }
+    if _RECORDER is not None:
+        path = _RECORDER.directory / "runtime-observed.json"
+        write_json(path, result)
+        _RECORDER.artifact("Observed engine, containers and image identities", path)
+    return result
+
+
+def snapshot_inputs(state, directory):
+    if _RECORDER is None:
+        return
+    output = _RECORDER.directory / "inputs"
+    output.mkdir(parents=True, exist_ok=True)
+    files = {
+        "compose.json": Path(state["config"]),
+        "images.lock.json": Path(state["images_lock"]),
+        "flags.json": directory / "flags/demo.flagd.json",
+        "envoy.tmpl.yaml": directory / "envoy.tmpl.yaml",
+        "source-manifest.json": PUBLIC / "source-manifest.json",
+        "stories.json": PUBLIC / "stories.json",
+        "runtime-profile.json": PUBLIC / "runtime-profile.json",
+        "collector.yaml": PUBLIC / "collector.yaml",
+        "source-inventory.json": Path(state["workspace"]).with_name(
+            Path(state["workspace"]).name + ".source-inventory.json"
+        ),
+        "source-receipt.json": Path(state["workspace"]).parent
+        / (Path(state["workspace"]).name + ".source-receipt.json"),
+    }
+    manifest = []
+    for name, source in files.items():
+        if not source.is_file():
+            raise ValueError("A required run input is missing: " + name)
+        destination = output / name
+        shutil.copyfile(source, destination)
+        manifest.append(
+            {
+                "file": name,
+                "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+                "bytes": destination.stat().st_size,
+            }
+        )
+        _RECORDER.artifact(name, destination)
+    write_json(
+        output / "manifest.json",
+        {"files": manifest, "source_commit": "2c4be61741536937f1486ecaf74f44dbfd15d707"},
+    )
+    tool_sources = [
+        "shop.py",
+        "bootstrap_source.py",
+        "source_integrity.py",
+        "processes.py",
+        "logwatch.py",
+        "evidence.py",
+    ]
+    write_json(
+        output / "launcher-source-hashes.json",
+        {"files": {name: hashlib.sha256((PUBLIC / name).read_bytes()).hexdigest() for name in tool_sources}},
+    )
+    _RECORDER.artifact("Run input manifest", output / "manifest.json")
+    if state.get("telemetry_directory") and Path(state["telemetry_directory"]).exists():
+        _RECORDER.artifact("Application traces folder", Path(state["telemetry_directory"]))
+
+
+def scoped_config(rendered, images, project, flags, http_port, mcp_port, envoy_template=None, telemetry=None):
+    compose_args({"project": project, "config": "pending", "docker_context": "source-validation"}, [])
+    if any(name not in rendered["services"] for name in CORE_SERVICES):
+        raise ValueError("Pinned upstream render lacks a required core service.")
+    services = {}
+    for name in CORE_SERVICES:
+        service = copy.deepcopy(rendered["services"][name])
+        service.pop("build", None)
+        service.pop("profiles", None)
+        service.pop("container_name", None)
+        service.get("deploy", {}).pop("placement", None)
+        service["image"] = images[name]
+        service["restart"] = "no"
+        service["ports"] = []
+        service["networks"] = {"default": None}
+        depends = service.get("depends_on", {})
+        service["depends_on"] = {key: value for key, value in depends.items() if key in CORE_SERVICES}
+        env = service.get("environment", {})
+        if isinstance(env, dict):
+            service["environment"] = {
+                key: value
+                for key, value in env.items()
+                if not key.startswith(("LLM_", "OPENAI_", "TRACELOOP_")) and key != "API_KEY"
+            }
+        service["platform"] = "linux/amd64"
+        services[name] = service
+    services["checkout"].setdefault("environment", {})["KAFKA_ADDR"] = ""
+    services["mcp"].setdefault("environment", {})["TRACELOOP_BASE_URL"] = "http://otel-collector:4318"
+    if envoy_template is not None:
+        services["frontend-proxy"]["volumes"] = [
+            {
+                "type": "bind",
+                "source": str(envoy_template.absolute()),
+                "target": "/home/envoy/envoy.tmpl.yaml",
+                "read_only": True,
+            }
+        ]
+    services["frontend-proxy"]["ports"] = [
+        {"target": 8080, "published": str(http_port), "host_ip": "127.0.0.1", "protocol": "tcp"}
+    ]
+    services["mcp"]["ports"] = [
+        {"target": 8011, "published": str(mcp_port), "host_ip": "127.0.0.1", "protocol": "tcp"}
+    ]
+    # Docker cannot publish ports for containers attached exclusively to an
+    # internal bridge. Only the two loopback entrypoints get a gateway network.
+    for entrypoint in ("frontend-proxy", "mcp"):
+        services[entrypoint]["networks"]["edge"] = None
+    services["flagd"]["volumes"] = [
+        {"type": "bind", "source": str(flags.absolute()), "target": "/etc/flagd", "read_only": True}
+    ]
+    services["otel-collector"]["volumes"] = [
+        {
+            "type": "bind",
+            "source": str(PUBLIC / "collector.yaml"),
+            "target": "/etc/otelcol/config.yaml",
+            "read_only": True,
+        }
+    ]
+    if telemetry is not None:
+        services["otel-collector"]["volumes"].append(
+            {"type": "bind", "source": str(telemetry.absolute()), "target": "/evidence", "read_only": False}
+        )
+    services["otel-collector"]["command"] = ["--config=/etc/otelcol/config.yaml"]
+    volumes = copy.deepcopy(rendered.get("volumes", {}))
+    for name, volume in volumes.items():
+        if volume.get("external"):
+            raise ValueError("External volumes are outside the sample namespace.")
+        volume["name"] = project + "_" + name
+    return apply_runtime_profile(
+        {
+            "name": project,
+            "services": services,
+            "networks": {
+                "default": {"name": project + "_default", "driver": "bridge", "internal": True},
+                "edge": {"name": project + "_edge", "driver": "bridge", "internal": False},
+            },
+            "volumes": volumes,
+        }
+    )
+
+
+def request(port, method, path, body=None):
+    connection = http.client.HTTPConnection(
+        "127.0.0.1",
+        port,
+        timeout=PROFILE["checkout_http_seconds"]
+        if method == "POST" and path.startswith("/api/checkout")
+        else PROFILE["read_http_seconds"],
+    )
+    try:
+        payload = None if body is None else json.dumps(body).encode()
+        connection.request(method, path, body=payload, headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        raw = response.read(1048577)
+        if len(raw) > 1048576:
+            raise ValueError("Demo response exceeds the bounded sample limit.")
+        try:
+            decoded = json.loads(raw) if raw else None
+        except (ValueError, UnicodeError):
+            decoded = {"non_json_response": True, "response_bytes": len(raw)}
+        return response.status, decoded
+    finally:
+        connection.close()
+
+
+def validate_user(user):
+    if not re.fullmatch(r"shop-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", user):
+        raise ValueError("Choose a fresh synthetic shopper ID: shop-<UUIDv4>.")
+
+
+def reset_subject(state, user, http=request):
+    validate_user(user)
+    if user not in state["users"] or state["users"][user].get("status") != "OBSERVED":
+        raise ValueError(
+            "Only recorded, reconciled synthetic shoppers may be reset; uncertain checkout is not retried or reset automatically."
+        )
+    status, _ = http(state["http_port"], "DELETE", "/api/cart", {"userId": user})
+    if status not in (200, 204):
+        raise RuntimeError("Exact shopper cart reset failed; no retry was made.")
+    read_status, cart = http(state["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD")
+    if read_status != 200 or not isinstance(cart, dict) or cart.get("items") != []:
+        raise RuntimeError("Reset acknowledgement did not produce an API empty-cart readback; no retry.")
+    return {
+        "synthetic_cart_reset_status": status,
+        "API_cart_readback_empty": True,
+        "other_data_touched": False,
+    }
+
+
+def claim_checkout(directory, user):
+    validate_user(user)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / (user + ".claim")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, b"one checkout dispatch; never automatically retry\n")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return path
+
+
+def cart_items(value):
+    result = []
+    if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+        raise ValueError("Cart read has no valid items array; empty-cart observation is unknown.")
+    for item in value["items"]:
+        if not isinstance(item, dict):
+            raise ValueError("Cart item schema is invalid; cart observation is unknown.")
+        product = item.get("productId", item.get("product_id"))
+        quantity = item.get("quantity")
+        if not isinstance(product, str) or not product or type(quantity) is not int or quantity <= 0:
+            raise ValueError("Cart item identity or quantity is invalid; cart observation is unknown.")
+        result.append({"product_id": product, "quantity": quantity})
+    return result
+
+
+def verify_health(state, runner=native, http=request):
+    raw = runner(compose_args(state, ["ps", "--format", "json"]))
+    try:
+        records = json.loads(raw)
+        if isinstance(records, dict):
+            records = [records]
+    except json.JSONDecodeError:
+        records = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    by_service = {x.get("Service"): x for x in records}
+    unhealthy = [
+        name
+        for name in CORE_SERVICES
+        if name not in by_service
+        or by_service[name].get("State") != "running"
+        or by_service[name].get("Health") not in (None, "", "healthy")
+    ]
+    if unhealthy:
+        raise ValueError(
+            "Core services are not ready: " + ", ".join(unhealthy) + ". No story mutation was dispatched."
+        )
+    status, products = http(state["http_port"], "GET", "/api/products?currencyCode=USD")
+    if status != 200 or not isinstance(products, list) or not products:
+        raise ValueError("Read-only catalogue health check failed; no story mutation was dispatched.")
+    probe = """import asyncio,json
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+async def main():
+ async with streamablehttp_client("http://127.0.0.1:8011/mcp") as (read,write,_):
+  async with ClientSession(read,write) as session:
+   await session.initialize()
+   tools=await session.list_tools()
+   print(json.dumps({"ready":"get_cart" in [x.name for x in tools.tools]}))
+asyncio.run(main())
+"""
+    ready = json.loads(runner(compose_args(state, ["exec", "-T", "mcp", "python", "-"]), probe))
+    if ready.get("ready") is not True:
+        raise ValueError(
+            "Read-only MCP initialize/list health check failed; no story mutation was dispatched."
+        )
+    return True
+
+
+def wait_ready(state, runner=native, http=request, *, seconds=60, pause=time.sleep, clock=time.monotonic):
+    deadline = clock() + seconds
+    while True:
+        try:
+            return verify_health(state, runner, http)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            if clock() >= deadline:
+                raise RuntimeError(
+                    "The read-only startup check did not become ready; no story was dispatched."
+                ) from error
+            progress("Waiting for browser/API and MCP endpoints to become ready...", status="waiting")
+            pause(2)
+
+
+def run_story(state, directory, user, fixture=None, http=request, runner=native):
+    validate_user(user)
+    if user in state["users"]:
+        raise ValueError(
+            "Shopper was already used. Replay requires a new synthetic ID, never a checkout retry."
+        )
+    story = state["story"]
+    if STORIES[story]["action"] != "mcp-cart":
+        person = synthetic_fixture() if fixture is None else json.loads(fixture.read_bytes())
+        if _RECORDER is not None:
+            _RECORDER.set_redactions(
+                [str(person.get("email", "")), str(person.get("creditCard", {}).get("creditCardNumber", ""))]
+            )
+        if set(person) != {"email", "address", "creditCard", "userCurrency"}:
+            raise ValueError(
+                "Fixture requires only email/address/creditCard/userCurrency; do not include userId."
+            )
+    state["last_user"] = user
+    state["users"][user] = {"status": "STARTED"}
+    write_json(directory / "state.json", state)
+    status, products = http(state["http_port"], "GET", "/api/products?currencyCode=USD")
+    if status != 200 or not isinstance(products, list) or not products:
+        raise RuntimeError("Catalogue read failed; no fixture was added.")
+    product = products[0]["id"]
+    state["users"][user] = {"status": "SEED_DISPATCHED"}
+    write_json(directory / "state.json", state)
+    status, _ = http(
+        state["http_port"],
+        "POST",
+        "/api/cart?currencyCode=USD",
+        {"userId": user, "item": {"productId": product, "quantity": 1}},
+    )
+    if status != 200:
+        raise RuntimeError("Cart-add outcome is unsuccessful or unknown; no retry was made.")
+    before_status, before = http(
+        state["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD"
+    )
+    if before_status != 200:
+        raise RuntimeError("Cart prestate read failed; no checkout was dispatched.")
+    if STORIES[story]["action"] == "mcp-cart":
+        source = """import asyncio,json
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+async def main():
+ async with streamablehttp_client("http://127.0.0.1:8011/mcp") as (read,write,_):
+  async with ClientSession(read,write) as session:
+   await session.initialize()
+   tools=await session.list_tools()
+   result=await session.call_tool("get_cart",{"user_id":USER})
+   items=[]
+   for content in result.content:
+    if hasattr(content,"text"):
+     try: items=json.loads(content.text).get("items",[])
+     except (ValueError,AttributeError): pass
+   print(json.dumps({"initialized":True,"tool_names":[x.name for x in tools.tools],"is_error":result.isError,"items":[{"product_id":x.get("productId",x.get("product_id")),"quantity":x.get("quantity")} for x in items]}))
+asyncio.run(main())
+""".replace("USER", json.dumps(user))
+        result = json.loads(runner(compose_args(state, ["exec", "-T", "mcp", "python", "-"]), source))
+        outcome = {
+            "story": story,
+            "cart_HTTP_status": before_status,
+            "MCP_initialized": result["initialized"],
+            "tool_error": result["is_error"],
+            "HTTP_cart": cart_items(before),
+            "MCP_cart": result["items"],
+            "projections_match": cart_items(before) == result["items"],
+            "runtime_qualification": "OBSERVATION_ONLY_NOT_INDEPENDENT_EFFECT_PROOF",
+        }
+    else:
+        claim_checkout(directory / "checkout-claims", user)
+        state["users"][user] = {"status": "UNKNOWN_AFTER_DISPATCH"}
+        write_json(directory / "state.json", state)
+        status, response = http(
+            state["http_port"], "POST", "/api/checkout?currencyCode=USD", {"userId": user, **person}
+        )
+        after_status, after = http(
+            state["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD"
+        )
+        outcome = {
+            "story": story,
+            "checkout_HTTP_status": status,
+            "order_response_present": isinstance(response, dict) and bool(response.get("orderId")),
+            "cart_HTTP_status": after_status,
+            "cart_before": cart_items(before),
+            "cart_after": cart_items(after),
+            "runtime_qualification": "OBSERVATION_ONLY_NO_SETTLEMENT_OR_RETRY_SAFETY_CLAIM",
+        }
+    outcome["assessment"] = assess_story(story, outcome)
+    settled = STORIES[story]["action"] == "mcp-cart" or (status == 200 and after_status == 200)
+    state["users"][user] = {"status": "OBSERVED" if settled else "UNKNOWN_AFTER_DISPATCH", "story": story}
+    write_json(directory / "state.json", state)
+    write_json(directory / ("result-" + user + ".json"), outcome)
+    if _RECORDER is not None:
+        _RECORDER.result(outcome)
+    if not outcome["assessment"]["passed"]:
+        raise RuntimeError(
+            "The case did not match its expected behavior. Its result is preserved; no purchase was retried."
+        )
+    progress("Case complete: " + STORIES[story]["title"] + " behaved as described.")
+    return outcome
+
+
+def synthetic_fixture():
+    # Fictional public-demo data only; never use a real card or real personal data.
+    return {
+        "email": "shopper@example.test",
+        "address": {
+            "streetAddress": "1 Demo Way",
+            "city": "Example City",
+            "state": "CA",
+            "country": "United States",
+            "zipCode": "00000",
+        },
+        "userCurrency": "USD",
+        "creditCard": {
+            "creditCardNumber": "4111111111111111",
+            "creditCardCvv": 123,
+            "creditCardExpirationYear": dt.datetime.now(dt.UTC).year + 2,
+            "creditCardExpirationMonth": 12,
+        },
+    }
+
+
+def active_directory(base):
+    pointer = base / "active.json"
+    if not pointer.exists():
+        return base
+    relative = json.loads(pointer.read_bytes()).get("world", "")
+    if not re.fullmatch(r"worlds/[0-9a-f]{32}", relative):
+        raise ValueError("Active shop pointer is malformed.")
+    return base / relative
+
+
+def reserve_network(state, directory, runner=native):
+    config_path = Path(state["config"])
+    config = apply_runtime_profile(json.loads(config_path.read_bytes()))
+    write_json(config_path, config)
+    pending = [(key, network) for key, network in config["networks"].items() if not network.get("ipam")]
+    if not pending:
+        return
+    context = state["docker_context"]
+    raw = runner(["docker", "--context", context, "network", "ls", "--quiet"])
+    identifiers = raw.split()
+    if any(not re.fullmatch(r"[0-9a-f]{12,64}", item) for item in identifiers):
+        raise ValueError("Docker returned an invalid network census.")
+    occupied = []
+    if identifiers:
+        details = runner(
+            [
+                "docker",
+                "--context",
+                context,
+                "network",
+                "inspect",
+                *identifiers,
+                "--format",
+                "{{json .IPAM.Config}}",
+            ]
+        )
+        for line in details.splitlines():
+            for item in json.loads(line or "[]") or []:
+                subnet = item.get("Subnet")
+                if subnet:
+                    occupied.append(ipaddress.ip_network(subnet, strict=False))
+    for key, network in pending:
+        selected = next(
+            (
+                candidate
+                for candidate in ipaddress.ip_network("10.240.0.0/12").subnets(new_prefix=24)
+                if not any(
+                    candidate.version == existing.version and candidate.overlaps(existing)
+                    for existing in occupied
+                )
+            ),
+            None,
+        )
+        if selected is None:
+            raise ValueError("No free sample subnet was found. Existing networks were not changed.")
+        progress("Preparing the " + key + " network without changing existing projects...")
+        runner(
+            [
+                "docker",
+                "--context",
+                context,
+                "network",
+                "create",
+                "--driver",
+                "bridge",
+                *(["--internal"] if network.get("internal") else []),
+                "--subnet",
+                str(selected),
+                "--label",
+                "com.docker.compose.project=" + state["project"],
+                "--label",
+                "com.docker.compose.network=" + key,
+                network["name"],
+            ]
+        )
+        network["ipam"] = {"driver": "default", "config": [{"subnet": str(selected)}]}
+        occupied.append(selected)
+        write_json(config_path, config)
+        state["subnet" if key == "default" else key + "_subnet"] = str(selected)
+        write_json(directory / "state.json", state)
+
+
+def start_owned(state, directory, runner, http):
+    verify_world(state, directory)
+    snapshot_inputs(state, directory)
+    images = load_image_lock(Path(state["images_lock"]), state["source_variant"])
+    if hashlib.sha256(json.dumps(images, sort_keys=True).encode()).hexdigest() != state["images_sha256"]:
+        raise ValueError(
+            "Image mapping changed. Prepare a new shop rather than silently changing its source world."
+        )
+    if not state.get("started"):
+        reserve_network(state, directory, runner)
+        bind_world(state, directory)
+        write_json(directory / "state.json", state)
+        snapshot_inputs(state, directory)
+        print("Starting your isolated shop; first-time image downloads can take a while...")
+        runner(
+            compose_args(
+                state,
+                [
+                    "up",
+                    "-d",
+                    "--wait",
+                    "--wait-timeout",
+                    str(PROFILE["startup_wait_seconds"]),
+                    "--no-build",
+                    "--pull",
+                    "never" if images["mcp"].startswith("sha256:") else "missing",
+                ],
+            )
+        )
+        state["started"] = True
+        write_json(directory / "state.json", state)
+    if runner is native:
+        wait_ready(state, runner, http)
+        snapshot_runtime(state, directory, runner)
+    else:
+        verify_health(state, runner, http)
+    progress("Shop ready at http://127.0.0.1:" + str(state["http_port"]))
+    if runner is native:
+        from processes import start_watcher
+
+        try:
+            state["log_pid"] = start_watcher(state, directory, Path(state["evidence_root"]))
+        finally:
+            write_json(directory / "state.json", state)
+            if _RECORDER is not None and state.get("watcher_diagnostics"):
+                _RECORDER.artifact("Log companion startup diagnostics", Path(state["watcher_diagnostics"]))
+    if _RECORDER is not None:
+        _RECORDER.result(
+            {
+                "story": state["story"],
+                "app_url": "http://127.0.0.1:" + str(state["http_port"]),
+                "project": state["project"],
+                "images_lock": state["images_lock"],
+                "workspace": state["workspace"],
+            }
+        )
+
+
+def stop_owned(state, directory, runner):
+    verify_control_target(state, directory, runner)
+    if runner is native and _RECORDER is not None:
+        try:
+            runner(compose_args(state, ["logs", "--no-color", "--timestamps", "--tail", "500"]))
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            _RECORDER.phase(
+                "Final service-log snapshot was unavailable; earlier host logs remain preserved.",
+                status="unknown",
+                error=str(error),
+            )
+    runner(compose_args(state, ["stop", "--timeout", "30"]))
+    if runner is native:
+        from processes import stop_watcher
+
+        stop_watcher(state, directory)
+    state.pop("log_pid", None)
+    state["started"] = False
+    write_json(directory / "state.json", state)
+    print("Your shop is stopped; its data and previous attempt records are retained.")
+
+
+def dispatch_main(argv=None, runner=native, http=request):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--state-dir", type=Path, default=PUBLIC.parent / ".shop")
+    parser.add_argument("--evidence-dir", type=Path)
+    parser.add_argument("--no-browser", action="store_true")
+    commands = parser.add_subparsers(dest="command", required=True)
+    setup = commands.add_parser(
+        "setup", help="Prepare public source and render configuration; no app starts."
+    )
+    setup.add_argument("--workspace", type=Path)
+    setup.add_argument("--images", type=Path)
+    setup.add_argument("--story", choices=STORIES, default="normal-checkout")
+    setup.add_argument("--context")
+    setup.add_argument("--offline-archive-from", type=Path)
+    setup.add_argument("--allow-network-clone", action="store_true")
+    setup.add_argument("--http-port", type=int, default=8080)
+    setup.add_argument("--mcp-port", type=int, default=8011)
+    names = ("normal", *STORIES)
+    for name in ("start", "story"):
+        command = commands.add_parser(name)
+        command.add_argument("name", nargs="?", choices=names)
+        if name == "story":
+            command.add_argument("--user-id")
+            command.add_argument("--fixture", type=Path)
+    for command in ("stop", "clean", "view", "cases"):
+        commands.add_parser(command)
+    for name in ("reset", "replay"):
+        command = commands.add_parser(name)
+        command.add_argument("--user-id")
+        if name == "replay":
+            command.add_argument("--fixture", type=Path)
+    args = parser.parse_args(argv)
+    base = args.state_dir.absolute()
+    if args.command == "cases":
+        for name, story in STORIES.items():
+            print(name + ": " + story["description"])
+        return 0
+    if args.command == "view":
+        import webbrowser
+
+        target = (
+            _RECORDER.root if _RECORDER is not None else (args.evidence_dir or PUBLIC.parent / "evidence")
+        ) / "index.html"
+        if not args.no_browser and not os.environ.get("CI"):
+            webbrowser.open(target.resolve().as_uri())
+        print("Run viewer: " + str(target))
+        return 0
+    if args.command == "clean":
+        clean_worlds(base, runner)
+        return 0
+    directory = active_directory(base)
+    state_path = directory / "state.json"
+    state = json.loads(state_path.read_bytes()) if state_path.exists() else None
+    if state and state.get("removed"):
+        state = None
+    if args.command == "setup":
+        if state is not None:
+            raise ValueError("This shop is already prepared. Use start or story to select a story.")
+        directory = base
+        state_path = directory / "state.json"
+        variant = STORIES[args.story]["source_variant"]
+        image_path = (args.images or (PUBLIC / "runtime-images.lock.json")).absolute()
+        images = load_image_lock(image_path, "original", allow_pending=True)
+        workspace = (args.workspace or PUBLIC.parent / "external/workspace" / variant).absolute()
+        if not workspace.exists():
+            print("Preparing pinned public source only...")
+            acquire = [
+                sys.executable,
+                str(PUBLIC / "bootstrap_source.py"),
+                "--no-runtime",
+                "--materialize",
+                "--variant",
+                variant,
+                "--destination",
+                str(workspace),
+            ]
+            acquire += (
+                ["--offline-archive-from", str(args.offline_archive_from)]
+                if args.offline_archive_from
+                else ["--allow-network-clone"]
+            )
+            runner(acquire)
+        verify_source(workspace, variant)
+        if (
+            not all(1 <= x <= 65535 for x in (args.http_port, args.mcp_port))
+            or args.http_port == args.mcp_port
+        ):
+            raise ValueError("Choose two distinct valid loopback ports.")
+        context = args.context or runner(["docker", "context", "show"]).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", context):
+            raise ValueError("Docker context name is invalid.")
+        engine = runner(["docker", "--context", context, "info", "--format", "{{.ID}}"]).strip()
+        if not engine:
+            raise ValueError("Docker engine identity is unavailable; no application was started.")
+        if variant == "mcp-session-id":
+            proof = build_public_mcp(directory, workspace, context, runner)
+            images["mcp"] = proof["image_id"]
+            derived = json.loads(image_path.read_bytes())
+            derived.update(
+                status="QUALIFIED", source_variant=variant, services=images, public_mcp_derivation=proof
+            )
+            image_path = directory / "runtime-images.lock.json"
+            write_json(image_path, derived)
+        project = "shop-" + uuid.uuid4().hex[:12]
+        print("Rendering your shop without starting services...")
+        rendered = json.loads(
+            runner(
+                [
+                    "docker",
+                    "--context",
+                    context,
+                    "compose",
+                    "--project-name",
+                    project,
+                    "--project-directory",
+                    str(workspace),
+                    "--env-file",
+                    str(workspace / ".env"),
+                    "-f",
+                    str(workspace / "compose.yaml"),
+                    "-f",
+                    str(workspace / "compose.agent.yaml"),
+                    "config",
+                    "--no-consistency",
+                    "--format",
+                    "json",
+                ]
+            )
+        )
+        flags = json.loads((workspace / "src/flagd/demo.flagd.json").read_bytes())
+        for key in ("cartFailure", "paymentUnreachable"):
+            value = STORIES[args.story][key]
+            if value not in flags["flags"][key].get("variants", {}):
+                raise ValueError("Selected story requests an unsupported upstream flag variant.")
+            flags["flags"][key]["defaultVariant"] = value
+        if "emitRawPii" in flags["flags"]:
+            flags["flags"]["emitRawPii"]["defaultVariant"] = "off"
+        write_json(directory / "flags/demo.flagd.json", flags)
+        envoy_template = prepare_envoy(workspace, directory)
+        telemetry = (
+            (_RECORDER.root / "telemetry" / project) if _RECORDER is not None else directory / "telemetry"
+        )
+        telemetry.mkdir(parents=True, exist_ok=True)
+        telemetry.chmod(0o777)  # Only this new, synthetic-data exporter directory.
+        write_json(
+            directory / "compose.json",
+            scoped_config(
+                rendered,
+                images,
+                project,
+                directory / "flags",
+                args.http_port,
+                args.mcp_port,
+                envoy_template,
+                telemetry,
+            ),
+        )
+        runner(
+            [
+                "docker",
+                "--context",
+                context,
+                "compose",
+                "--project-name",
+                project,
+                "-f",
+                str(directory / "compose.json"),
+                "config",
+                "--quiet",
+            ]
+        )
+        state = {
+            "engine_id": engine,
+            "evidence_root": str(_RECORDER.root)
+            if _RECORDER is not None
+            else str(PUBLIC.parent / "evidence"),
+            "schema": "workflow-shop.v1",
+            "project": project,
+            "config": str(directory / "compose.json"),
+            "story": args.story,
+            "source_variant": variant,
+            "http_port": args.http_port,
+            "mcp_port": args.mcp_port,
+            "users": {},
+            "started": False,
+            "docker_context": context,
+            "workspace": str(workspace),
+            "telemetry_directory": str(telemetry),
+            "images_lock": str(image_path),
+            "base_images_lock": str((args.images or PUBLIC / "runtime-images.lock.json").absolute()),
+            "images_sha256": hashlib.sha256(json.dumps(images, sort_keys=True).encode()).hexdigest(),
+        }
+        bind_world(state, directory)
+        write_json(state_path, state)
+        print("Setup complete. No app was started. Next: shop start.")
+        return 0
+    requested = getattr(args, "name", None)
+    if requested == "normal":
+        requested = "normal-checkout"
+    selected = requested or (state["story"] if state else "normal-checkout")
+    if args.command in ("start", "story", "replay", "reset") and (
+        state is None or requested and requested != state["story"] or args.command in ("replay", "reset")
+    ):
+        # Every explicit replay gets a fresh project and shopper. Never dispatch an old claim again.
+        if args.command == "replay" and args.user_id and state and args.user_id in state["users"]:
+            raise ValueError(
+                "Replay requires a fresh synthetic shopper; old checkout intent is never retried."
+            )
+        relative = "worlds/" + uuid.uuid4().hex
+        new_directory = base / relative
+        setup_args = ["--state-dir", str(new_directory), "setup", "--story", selected]
+        if state:
+            setup_args += [
+                "--context",
+                state["docker_context"],
+                "--http-port",
+                str(state["http_port"]),
+                "--mcp-port",
+                str(state["mcp_port"]),
+            ]
+            if state["source_variant"] == STORIES[selected]["source_variant"]:
+                setup_args += [
+                    "--workspace",
+                    state["workspace"],
+                    "--images",
+                    state.get("base_images_lock", str(PUBLIC / "runtime-images.lock.json")),
+                ]
+        main(setup_args, runner, http)
+        if state:
+            # Failed health must not prevent a fresh owned reset.
+            # A new project is the replay boundary; prior attempts stay untouched.
+            stop_owned(state, directory, runner)
+        write_json(base / "active.json", {"world": relative})
+        directory = new_directory
+        state_path = directory / "state.json"
+        state = json.loads(state_path.read_bytes())
+        if args.command == "replay":
+            print("Fresh replay prepared. Previous uncertain attempts and data remain preserved.")
+    if state is None:
+        if args.command == "stop":
+            progress("There is no active shop to stop. Your evidence is retained.")
+            return 0
+        raise ValueError("No shop is prepared yet. Run shop start normal.")
+    compose_args(state, [])
+    if args.command == "start":
+        start_owned(state, directory, runner, http)
+    elif args.command == "stop":
+        stop_owned(state, directory, runner)
+    elif args.command == "reset":
+        start_owned(state, directory, runner, http)
+        progress("Reset complete: a clean shop is ready; previous attempts remain preserved.")
+    else:
+        start_owned(state, directory, runner, http)
+        verify_health(state, runner, http)
+        print(STORIES[state["story"]]["description"])
+        user = args.user_id or "shop-" + str(uuid.uuid4())
+        print(json.dumps(run_story(state, directory, user, args.fixture, http, runner), indent=2))
+    return 0
+
+
+def clean_worlds(base, runner=native):
+    paths = [base / "state.json", *sorted((base / "worlds").glob("*/state.json"))]
+    removed = 0
+    for path in paths:
+        if not path.is_file():
+            continue
+        directory = path.parent
+        if not directory.resolve().is_relative_to(base.resolve()):
+            raise ValueError("A shop record escapes the selected state folder.")
+        state = json.loads(path.read_bytes())
+        compose_args(state, [])
+        if state.get("removed"):
+            continue
+        config = Path(state["config"]).resolve()
+        if config != (directory / "compose.json").resolve():
+            raise ValueError("Shop cleanup refused a configuration outside its recorded world.")
+        rendered = json.loads(config.read_bytes())
+        resources = [*rendered.get("volumes", {}).values(), *rendered.get("networks", {}).values()]
+        if rendered.get("name") != state["project"] or any(
+            v.get("external") or not str(v.get("name", "")).startswith(state["project"] + "_")
+            for v in resources
+        ):
+            raise ValueError("Shop cleanup refused resources outside its own namespace.")
+        stop_owned(state, directory, runner)
+        verify_control_target(state, directory, runner)
+        runner(compose_args(state, ["down", "--volumes", "--remove-orphans"]))
+        state["removed"] = True
+        write_json(path, state)
+        removed += 1
+    progress("Cleanup complete: " + str(removed) + " recorded shops removed. Host evidence is untouched.")
+
+
+def main(argv=None, runner=native, http=request):
+    global _RECORDER
+    actual = list(sys.argv[1:] if argv is None else argv)
+    outer = runner is native and _RECORDER is None and not any(x in actual for x in ("--help", "-h"))
+    if outer:
+        from evidence import EvidenceRecorder
+
+        pre = argparse.ArgumentParser(add_help=False)
+        pre.add_argument("--state-dir", type=Path, default=PUBLIC.parent / ".shop")
+        pre.add_argument("--evidence-dir", type=Path)
+        pre.add_argument("--no-browser", action="store_true")
+        known, _ = pre.parse_known_args(actual)
+        saved = {}
+        try:
+            saved = json.loads((active_directory(known.state_dir.absolute()) / "state.json").read_bytes())
+        except (OSError, ValueError):
+            pass
+        folder = known.evidence_dir or Path(saved.get("evidence_root", PUBLIC.parent / "evidence"))
+        story = next((x for x in actual if x in STORIES), saved.get("story", "normal-checkout"))
+        command = next(
+            (
+                x
+                for x in actual
+                if x in ("setup", "start", "story", "reset", "replay", "stop", "clean", "view", "cases")
+            ),
+            "help",
+        )
+        _RECORDER = EvidenceRecorder(
+            folder,
+            command,
+            STORIES.get(story, {}).get("title", story),
+            open_browser=not known.no_browser and not os.environ.get("CI") and command != "cases",
+        )
+        fixture = synthetic_fixture()
+        _RECORDER.set_redactions([fixture["email"], fixture["creditCard"]["creditCardNumber"]])
+        _RECORDER.phase("Starting " + command + ". Evidence is stored on the host, outside Docker.")
+    try:
+        result = dispatch_main(actual, runner, http)
+        if outer:
+            _RECORDER.finish("passed" if result == 0 else "failed")
+        return result
+    except BaseException as error:
+        if outer:
+            _RECORDER.finish("failed", str(error))
+        raise
+    finally:
+        if outer:
+            print("Evidence: " + str(_RECORDER.index_path), flush=True)
+            _RECORDER = None
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        print("Shop could not complete this step: " + str(exc), file=sys.stderr)
+        raise SystemExit(1)

@@ -1,0 +1,11 @@
+/local-only/
+/external/
+/workspace/
+__pycache__/
+*.pyc
+/.shop*/
+
+/evidence/
+/.reconstruction/
+/.ci-shop/
+.ruff_cache/

@@ -1,0 +1,31 @@
+{
+  "schema": "public-workflow-runtime-image-lock.v1",
+  "status": "QUALIFIED",
+  "source_variant": "original",
+  "source_commit": "2c4be61741536937f1486ecaf74f44dbfd15d707",
+  "platform": "linux/amd64",
+  "services": {
+    "ad": "ghcr.io/open-telemetry/demo@sha256:f667c6b0849b140345406c966ccf235f3f082ec3397e07b27fb11b7fd8d94843",
+    "cart": "ghcr.io/open-telemetry/demo@sha256:904d59ee167f901c1ea1b4042ba550db4fe18b6b26cf94162b7392f8155313a1",
+    "checkout": "ghcr.io/open-telemetry/demo@sha256:a02c5b4f06ad08a0cfc8660dd7aca5bb8b37dc397dd21bc6d7941bb42c40c4d7",
+    "currency": "ghcr.io/open-telemetry/demo@sha256:33a301802967c8b4616d325bd9e8502a1c9d3e000594d69b4bf152e75f8a0a74",
+    "email": "ghcr.io/open-telemetry/demo@sha256:74d8afee577344a975eefdd45f36ab3a7a0e8a927ef301712458905e42dc56ef",
+    "frontend": "ghcr.io/open-telemetry/demo@sha256:28f7eeb2b45d1d04021712b9230aff2342ccfc06b0ba13096be7de0f862f1f3d",
+    "frontend-proxy": "ghcr.io/open-telemetry/demo@sha256:fed5001175a3f6daf35c0de420c80953f02e7d740a798e95594100498efb1e1d",
+    "image-provider": "ghcr.io/open-telemetry/demo@sha256:5da6eff70381317f148564073279ad855deefb9bd8519397a1863b0c48e8ebcb",
+    "payment": "ghcr.io/open-telemetry/demo@sha256:faec3a2ea10dc4f6234c2b3501f55956a5936c143a0c2cbd36d548482653df3a",
+    "product-catalog": "ghcr.io/open-telemetry/demo@sha256:1944520cd2fd88671d610108a6fe4d88c65e221bb50027ec1e5f7d3938f85732",
+    "quote": "ghcr.io/open-telemetry/demo@sha256:09fb8b5a63fcb2f6c802c464a0ab7f46a59b571841555bed7f87ba87fedca040",
+    "recommendation": "ghcr.io/open-telemetry/demo@sha256:720dcb9cb3167ef69496f4d777e1df3a217ffea34195dc242edcdc9c7ef510c1",
+    "shipping": "ghcr.io/open-telemetry/demo@sha256:1ad46b4449407fb6414dac2e9efc8683cf03e6a47054b36ed273c91c130841e7",
+    "mcp": "ghcr.io/open-telemetry/demo@sha256:8cea957d3930d9df7365c0d655835bf3d553d097eae80d4428dac40b29ef533c",
+    "flagd": "ghcr.io/open-feature/flagd@sha256:128e5f6a0d34dc3224c762167997db767b034c0bd660db15a42fc487b5df0541",
+    "valkey-cart": "ghcr.io/valkey-io/valkey@sha256:3b83b0b6a598bb390c8186a408a69949772f439548a81c5ea0ab7ccf102c248d",
+    "astronomy-db": "docker.io/library/postgres@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6",
+    "otel-collector": "ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib@sha256:799dc6cf12c96192af37b5bdba804da8c10b3bc563b43cb90c3f3c58d9572ad6"
+  },
+  "application_provenance_file": "images.lock.json",
+  "application_provenance_scope": "SOURCE_CLAIM_VERIFIED; IMAGE_LAYER_AUDIT_AND_COLD_EXECUTION_PENDING",
+  "support_reference_status": "18 actual immutable pulls; configuration/history inspected; runtime checks pending",
+  "runtime_business_results": "NOT_RUN"
+}

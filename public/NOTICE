@@ -1,0 +1,9 @@
+OpenTelemetry Workflow Lab source bootstrap
+
+Upstream: https://github.com/open-telemetry/opentelemetry-demo
+Pinned source: 2c4be61741536937f1486ecaf74f44dbfd15d707
+Copyright The OpenTelemetry Authors.
+The upstream LICENSE is included unchanged (Apache License 2.0).
+Upstream copyright/license notices remain in materialized source.
+The optional compatibility patch changes only upstream Apache-2.0 files.
+This package contains public source pins, a source patch and bootstrap tooling.

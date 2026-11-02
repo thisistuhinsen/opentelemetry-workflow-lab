@@ -1,0 +1,44 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 128
+    spike_limit_mib: 32
+  batch: {}
+  attributes/sanitize:
+    actions:
+      - key: user.email
+        action: delete
+      - key: demo.payment.card_number
+        action: delete
+      - key: demo.payment.card_cvv
+        action: delete
+exporters:
+  debug:
+    verbosity: basic
+  file:
+    path: /evidence/traces.jsonl
+    format: json
+    append: true
+    flush_interval: 1s
+    create_directory: false
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/sanitize, batch]
+      exporters: [file, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]
