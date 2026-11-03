@@ -302,6 +302,16 @@ class NativeProcessTests(unittest.TestCase):
             self.assertFalse(processes.watcher_matches(41241, state_file))
         check_output.assert_not_called()
 
+    def test_oversized_pid_markers_fail_closed_without_integer_overflow(self):
+        pid = 41249
+        state_file, _ = self._write_external_watcher_identity(self.root / "oversized pid", pid, "5" * 32)
+        oversized = "9" * 5000
+        state_file.with_suffix(".ready").write_text(f"{oversized} {'5' * 32}", encoding="utf-8")
+        state_file.with_suffix(".stopped").write_text(f"{oversized} {'5' * 32}", encoding="utf-8")
+        self.assertIsNone(processes._ready_identity(state_file))
+        self.assertFalse(processes._stopped_identity(state_file, pid, "5" * 32))
+        self.assertFalse(processes.watcher_matches(pid, state_file))
+
     def test_stopped_tracked_watcher_does_not_match(self):
         process = type("ExitedProcess", (), {"pid": 41242, "poll": lambda self: 0})()
         processes._WATCHERS[process.pid] = process

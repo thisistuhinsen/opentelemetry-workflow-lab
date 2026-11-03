@@ -136,12 +136,25 @@ def _ready_identity(state_file: Path):
         fields = state_file.with_suffix(".ready").read_text(encoding="utf-8").split()
     except OSError:
         return None
-    if len(fields) != 2 or not fields[0].isdecimal():
+    if len(fields) != 2:
+        return None
+    pid = _parse_marker_pid(fields[0])
+    if pid is None:
         return None
     token = fields[1]
     if len(token) != 32 or any(character not in "0123456789abcdef" for character in token):
         return None
-    return int(fields[0]), token
+    return pid, token
+
+
+def _parse_marker_pid(value: str):
+    if len(value) > 10 or not value.isascii() or not value.isdecimal():
+        return None
+    try:
+        pid = int(value)
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
 
 
 def _watcher_argv(state_file: Path, evidence_root: str, handshake: str):
@@ -269,7 +282,7 @@ def _stopped_identity(state_file: Path, pid: int, handshake: str):
         fields = state_file.with_suffix(".stopped").read_text(encoding="utf-8").split()
     except OSError:
         return False
-    return len(fields) == 2 and fields[0].isdecimal() and int(fields[0]) == pid and fields[1] == handshake
+    return len(fields) == 2 and _parse_marker_pid(fields[0]) == pid and fields[1] == handshake
 
 
 def _forget_watcher(process: subprocess.Popen) -> None:
