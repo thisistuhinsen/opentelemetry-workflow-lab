@@ -4,7 +4,7 @@ Run a pinned Astronomy Shop locally, compare checkout and MCP behavior, and insp
 
 ## Start here
 
-Install Python 3.12+, Git, and Docker with the Compose plugin. Start Docker using Linux containers. The sample uses linux/amd64 images; budget about 8 GB for the Docker VM and space for the selected images. It binds only localhost ports 8080 and 8011. Windows, macOS and Linux are supported by the launcher; see CI for the platforms actually exercised.
+Install Python 3.12+, Git, and Docker with the Compose plugin. Start Docker using Linux containers. The sample uses linux/amd64 images; budget about 8 GB for the Docker VM and space for the selected images. It binds only localhost ports 8080 and 8011. Windows, macOS and Linux are supported by the launcher. CI runs the process and watcher lifecycle contract tests on all three platforms; the full Docker story run remains a single Ubuntu job. These checks do not establish that Docker Desktop is running or qualify a local full-stack run on each desktop OS.
 
 From this folder, use `shop.cmd` on Windows or `./shop` on Linux/macOS:
 

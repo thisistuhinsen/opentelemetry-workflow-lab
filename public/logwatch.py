@@ -47,7 +47,7 @@ def main():
         recorder.finish("failed", str(error))
         raise
     finally:
-        stopped_file.write_text(str(os.getpid()), encoding="utf-8")
+        stopped_file.write_text(f"{os.getpid()} {args.handshake}\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

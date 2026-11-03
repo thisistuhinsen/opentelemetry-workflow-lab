@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -130,25 +131,145 @@ def run_native(
     return "".join(collected["stdout"])
 
 
-def watcher_matches(pid, state_file):
-    if not isinstance(pid, int) or pid <= 0:
+def _ready_identity(state_file: Path):
+    try:
+        fields = state_file.with_suffix(".ready").read_text(encoding="utf-8").split()
+    except OSError:
+        return None
+    if len(fields) != 2 or not fields[0].isdecimal():
+        return None
+    token = fields[1]
+    if len(token) != 32 or any(character not in "0123456789abcdef" for character in token):
+        return None
+    return int(fields[0]), token
+
+
+def _watcher_argv(state_file: Path, evidence_root: str, handshake: str):
+    return [
+        sys.executable,
+        str(Path(__file__).with_name("logwatch.py")),
+        "--state",
+        str(state_file),
+        "--evidence",
+        evidence_root,
+        "--handshake",
+        handshake,
+    ]
+
+
+def _pid_is_running(pid: int):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return None
+    except OSError:
+        return None
+    return True
+
+
+def _external_watcher_identity(pid: int, state_file: Path, platform: str | None = None):
+    """Return owned, stopped, mismatched, or unknown without signaling a PID."""
+    platform = sys.platform if platform is None else platform
+    marker = _ready_identity(state_file)
+    if marker is None:
+        return "unknown", None
+    marker_pid, handshake = marker
+    if marker_pid != pid:
+        return "mismatched", handshake
+    try:
+        state = json.loads(state_file.read_bytes())
+        evidence_root = state.get("evidence_root") if isinstance(state, dict) else None
+        if not isinstance(evidence_root, str) or not evidence_root:
+            return "unknown", handshake
+    except (OSError, ValueError, TypeError):
+        return "unknown", handshake
+
+    expected = _watcher_argv(state_file, evidence_root, handshake)
+    try:
+        if platform == "win32":
+            script = (
+                f"$process = Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}'; "
+                "if ($null -eq $process) { 'MISSING' } "
+                "elseif ([string]::IsNullOrEmpty($process.CommandLine)) { 'UNREADABLE' } "
+                "else { $process.CommandLine }"
+            )
+            observed = subprocess.check_output(
+                ["powershell.exe", "-NoProfile", "-Command", script],
+                text=True,
+                errors="replace",
+                timeout=10,
+            ).strip()
+            if observed == "MISSING":
+                return "stopped", handshake
+            if observed == "UNREADABLE" or not observed:
+                return "unknown", handshake
+            return ("owned" if observed == subprocess.list2cmdline(expected) else "mismatched"), handshake
+        if platform == "darwin":
+            try:
+                observed = subprocess.check_output(
+                    ["ps", "-ww", "-p", str(pid), "-o", "command="],
+                    text=True,
+                    errors="replace",
+                    timeout=10,
+                ).strip()
+            except subprocess.CalledProcessError:
+                running = _pid_is_running(pid)
+                return ("mismatched" if running else "stopped" if running is False else "unknown"), handshake
+            if not observed:
+                running = _pid_is_running(pid)
+                return ("mismatched" if running else "stopped" if running is False else "unknown"), handshake
+            return ("owned" if observed == " ".join(expected) else "mismatched"), handshake
+        if platform.startswith("linux"):
+            try:
+                observed = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[:-1]
+            except FileNotFoundError:
+                return "stopped", handshake
+            except OSError:
+                return "unknown", handshake
+            if not observed:
+                return "unknown", handshake
+            decoded = [argument.decode("utf-8", "replace") for argument in observed]
+            return ("owned" if decoded == expected else "mismatched"), handshake
+    except (OSError, subprocess.SubprocessError):
+        return "unknown", handshake
+    return "unknown", handshake
+
+
+def _watcher_identity(pid, state_file: Path):
+    if type(pid) is not int or pid <= 0:
+        return "stopped", None
     tracked = _WATCHERS.get(pid)
     if tracked is not None:
-        return tracked.poll() is None
+        if tracked.pid != pid:
+            return "mismatched", None
+        try:
+            running = tracked.poll() is None
+        except Exception:
+            return "unknown", None
+        marker = _ready_identity(state_file)
+        if not running:
+            return "stopped", marker[1] if marker and marker[0] == pid else None
+        if marker is None or marker[0] != pid:
+            return "unknown", None
+        return "owned", marker[1]
+    status, handshake = _external_watcher_identity(pid, state_file)
+    if status != "owned" and handshake and _stopped_identity(state_file, pid, handshake):
+        return "stopped", handshake
+    return status, handshake
+
+
+def watcher_matches(pid, state_file):
+    return _watcher_identity(pid, Path(state_file))[0] == "owned"
+
+
+def _stopped_identity(state_file: Path, pid: int, handshake: str):
     try:
-        if os.name == "nt":
-            script = f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine"
-            command = subprocess.check_output(
-                ["powershell.exe", "-NoProfile", "-Command", script], text=True, errors="replace", timeout=10
-            )
-        else:
-            command = (
-                Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
-            )
-        return "logwatch.py" in command and str(state_file).casefold() in command.casefold()
-    except (OSError, subprocess.SubprocessError):
+        fields = state_file.with_suffix(".stopped").read_text(encoding="utf-8").split()
+    except OSError:
         return False
+    return len(fields) == 2 and fields[0].isdecimal() and int(fields[0]) == pid and fields[1] == handshake
 
 
 def _forget_watcher(process: subprocess.Popen) -> None:
@@ -188,11 +309,14 @@ def _watcher_diagnostics(directory: Path) -> str:
 def start_watcher(state, directory, evidence_root):
     state_file = Path(directory) / "state.json"
     current = state.get("log_pid")
-    if watcher_matches(current, state_file):
+    current_status, _ = _watcher_identity(current, state_file)
+    if current_status == "owned":
         ready, _, _ = _control_paths(state_file)
         if ready.is_file():
             return current
         raise RuntimeError("The existing service-log watcher has no startup handshake.")
+    if current_status in {"unknown", "mismatched"}:
+        raise RuntimeError("Cannot verify the existing service-log watcher; no replacement was started.")
     ready, stop_file, stopped = _control_paths(state_file)
     for path in (ready, stop_file, stopped):
         path.unlink(missing_ok=True)
@@ -240,7 +364,7 @@ def start_watcher(state, directory, evidence_root):
             # The freshly generated nonce binds the marker to this launch. It
             # avoids OS command-line formatting differences while the live
             # Popen handle remains the process we wait for and reap.
-            if ready_pid > 0 and process.poll() is None:
+            if ready_pid == process.pid and process.poll() is None:
                 if marker_token == handshake:
                     _WATCHERS[ready_pid] = process
                     return ready_pid
@@ -258,6 +382,9 @@ def start_watcher(state, directory, evidence_root):
         raise TimeoutError(
             "Service-log watcher did not stop after startup timeout; process remains owned and was not force-killed."
         )
+    if not _stopped_identity(state_file, process.pid, handshake):
+        _forget_watcher(process)
+        raise RuntimeError("Service-log watcher exited without a verified terminal stop marker.")
     _forget_watcher(process)
     detail = _watcher_diagnostics(diagnostics)
     try:
@@ -272,15 +399,18 @@ def start_watcher(state, directory, evidence_root):
 
 def stop_watcher(state, directory):
     pid = state.get("log_pid")
-    if not isinstance(pid, int) or pid <= 0:
+    if type(pid) is not int or pid <= 0:
         return
     state_file = Path(directory) / "state.json"
-    if not watcher_matches(pid, state_file):
+    identity, handshake = _watcher_identity(pid, state_file)
+    if identity == "stopped":
         process = _WATCHERS.pop(pid, None)
         if process is not None:
             process.wait(timeout=10)
             _forget_watcher(process)
         return
+    if identity != "owned" or handshake is None:
+        raise RuntimeError("Cannot verify the service-log watcher; no unrelated PID was signaled.")
     _request_stop(state_file)
     process = _WATCHERS.get(pid)
     if process is not None:
@@ -294,11 +424,18 @@ def stop_watcher(state, directory):
             _forget_watcher(process)
         if process.returncode is None:
             raise RuntimeError("Could not reap the service-log watcher process.")
+        if not _stopped_identity(state_file, pid, handshake):
+            raise RuntimeError("Service-log watcher stopped without a verified terminal marker.")
         return
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
-        if not watcher_matches(pid, state_file):
+        identity, _ = _watcher_identity(pid, state_file)
+        if _stopped_identity(state_file, pid, handshake):
             return
+        if identity in {"unknown", "mismatched"}:
+            raise RuntimeError("Watcher identity became unprovable during cleanup; no other PID was signaled.")
+        if identity == "stopped":
+            raise RuntimeError("Service-log watcher exited without a verified terminal marker.")
         time.sleep(0.1)
     raise TimeoutError(
         "Service-log watcher did not stop after the cooperative signal; no unrelated PID was killed."
