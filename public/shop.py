@@ -1863,11 +1863,13 @@ def run_agent_replay(state, directory, runner=native, http=request):
         "live_inference": False,
     }
     successful = False
+    stage = "world-start"
     agent_may_exist = False
     container_id = None
     try:
         if not state.get("started"):
             start_owned(state, directory, runner, http)
+        stage = "isolation-config"
         config = json.loads(Path(state["config"]).read_bytes())
         expected_network = state["project"] + "_agent-replay"
         agent_service = config.get("services", {}).get("agent", {})
@@ -1887,6 +1889,7 @@ def run_agent_replay(state, directory, runner=native, http=request):
         ):
             raise ValueError("Replay-only isolation/configuration is absent; no agent prompt was sent.")
         agent_may_exist = True
+        stage = "agent-start"
         runner(
             compose_args(
                 state,
@@ -1896,6 +1899,7 @@ def run_agent_replay(state, directory, runner=native, http=request):
         container_id = runner(compose_args(state, ["ps", "--quiet", "agent"])).strip()
         if not re.fullmatch(r"[0-9a-f]{12,64}", container_id):
             raise RuntimeError("Agent container identity is unavailable; no prompt was sent.")
+        stage = "container-boundary"
         inspect_prefix = ["docker", "--context", state["docker_context"], "inspect", container_id]
         mounts = json.loads(runner([*inspect_prefix, "--format", "{{json .Mounts}}"]))
         port_bindings = json.loads(runner([*inspect_prefix, "--format", "{{json .HostConfig.PortBindings}}"]))
@@ -1933,6 +1937,7 @@ def run_agent_replay(state, directory, runner=native, http=request):
         ).strip()
         if internal.lower() != "true":
             raise RuntimeError("Agent replay network is not Docker-internal; no prompt was sent.")
+        stage = "runtime-guard"
         verify_script = (
             "import hashlib,json,os,vcr; from src.agents.patch_vcr import VCR; "
             "assert vcr.__version__ == '8.3.0'; "
@@ -1949,6 +1954,7 @@ def run_agent_replay(state, directory, runner=native, http=request):
         )
         if guard.get("overlay_sha256") != outcome["overlay_sha256"]:
             raise RuntimeError("Agent replay guard did not load the captured overlay; no prompt was sent.")
+        stage = "fixture-endpoint"
         request_script = r"""import hashlib,json,urllib.request
 body=json.dumps({'message':'Show all available products in the store.','history':[]}).encode()
 request=urllib.request.Request('http://127.0.0.1:8010/prompt',data=body,headers={'Content-Type':'application/json'})
@@ -1981,12 +1987,14 @@ print(json.dumps({'http_status':status,'tool_names':sorted(set(tool_names)),'mes
             )
         outcome.update(replay, status="FIXTURE_REPLAY", agent_container_id=container_id)
         successful = True
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+    except Exception as error:
         # Keep endpoint failures actionable without copying arbitrary service or
         # request text into the public result record.
         outcome["error_type"] = type(error).__name__
+        outcome["failure_stage"] = stage
     finally:
         if agent_may_exist:
+            stage = "agent-stop"
             try:
                 runner(compose_args(state, ["stop", "--timeout", "10", "agent"]))
                 stopped = (
@@ -2011,12 +2019,25 @@ print(json.dumps({'http_status':status,'tool_names':sorted(set(tool_names)),'mes
                     successful = False
             except (OSError, RuntimeError, subprocess.SubprocessError):
                 outcome["agent_stopped"] = False
+                outcome["cleanup_error_type"] = "AgentStopUnconfirmed"
                 successful = False
+            if not outcome.get("agent_stopped"):
+                outcome["cleanup_failure_stage"] = "agent-stop"
         outcome["completed_utc"] = dt.datetime.now(dt.UTC).isoformat()
         write_json(result_path, outcome)
         if _RECORDER is not None:
-            _RECORDER.artifact("Public agent cassette replay summary", result_path)
             _RECORDER.result(outcome)
+            try:
+                _RECORDER.artifact("Public agent cassette replay summary", result_path)
+            except Exception as error:
+                outcome.update(
+                    status="UNKNOWN",
+                    error_type=type(error).__name__,
+                    failure_stage="evidence-artifact",
+                )
+                write_json(result_path, outcome)
+                _RECORDER.result(outcome)
+                successful = False
     if not successful or outcome.get("agent_stopped") is not True:
         raise RuntimeError("Agent cassette replay is UNKNOWN; no external model call or retry was allowed.")
     return outcome

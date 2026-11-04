@@ -960,6 +960,91 @@ def campaign_failure_diagnostic(summary, phase):
             )
             if key in browser
         }
+    agent = summary.get("agent_replay")
+    if isinstance(agent, dict):
+        agent_detail = {}
+        stage = agent.get("failure_stage")
+        if stage in {
+            "world-start",
+            "isolation-config",
+            "agent-start",
+            "container-boundary",
+            "runtime-guard",
+            "fixture-endpoint",
+            "agent-stop",
+            "evidence-artifact",
+        }:
+            agent_detail["failure_stage"] = stage
+        cleanup_stage = agent.get("cleanup_failure_stage")
+        if cleanup_stage == "agent-stop":
+            agent_detail["cleanup_failure_stage"] = cleanup_stage
+        for field in ("error_type", "cleanup_error_type"):
+            error_type = agent.get(field)
+            if isinstance(error_type, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", error_type):
+                agent_detail[field] = error_type
+        if type(agent.get("agent_stopped")) is bool:
+            agent_detail["agent_stopped"] = agent["agent_stopped"]
+        if agent_detail:
+            diagnostic["agent_replay_diagnostic"] = agent_detail
+    return diagnostic
+
+
+def agent_replay_failure_diagnostic(evidence, prior_runs):
+    """Read only allowlisted result fields from one new failed replay command."""
+    runs = evidence / "runs"
+    try:
+        fresh = sorted(set(runs.glob("*/run.json")) - prior_runs)
+    except OSError:
+        fresh = []
+    matches = []
+    for path in fresh:
+        try:
+            if (
+                path.is_symlink()
+                or not path.resolve().is_relative_to(evidence.resolve())
+                or not path.is_file()
+                or path.stat().st_size > 65536
+            ):
+                continue
+            run = read_json(path)
+            result_path = path.parent / "result.json"
+            if (
+                result_path.is_symlink()
+                or not result_path.resolve().is_relative_to(evidence.resolve())
+                or not result_path.is_file()
+                or result_path.stat().st_size > 65536
+            ):
+                continue
+            result = read_json(result_path)
+        except (OSError, ValueError, RuntimeError):
+            continue
+        if isinstance(run, dict) and run.get("command") == "agent-replay" and isinstance(result, dict):
+            matches.append(result)
+    if len(matches) != 1:
+        return {"status": "UNKNOWN"}
+    result = matches[0]
+    diagnostic = {"status": "UNKNOWN"}
+    stage = result.get("failure_stage")
+    if stage in {
+        "world-start",
+        "isolation-config",
+        "agent-start",
+        "container-boundary",
+        "runtime-guard",
+        "fixture-endpoint",
+        "agent-stop",
+        "evidence-artifact",
+    }:
+        diagnostic["failure_stage"] = stage
+    cleanup_stage = result.get("cleanup_failure_stage")
+    if cleanup_stage == "agent-stop":
+        diagnostic["cleanup_failure_stage"] = cleanup_stage
+    for field in ("error_type", "cleanup_error_type"):
+        error_type = result.get(field)
+        if isinstance(error_type, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", error_type):
+            diagnostic[field] = error_type
+    if type(result.get("agent_stopped")) is bool:
+        diagnostic["agent_stopped"] = result["agent_stopped"]
     return diagnostic
 
 
@@ -1834,6 +1919,58 @@ def self_test():
             self.assertEqual(calls, [("agent-replay",)])
             self.assertEqual(prior, {existing / "run.json"})
 
+        def test_agent_replay_failure_summary_is_phase_scoped_and_redacted(self):
+            secret = "private synthetic diagnostic text"
+            run_path = self.campaign.evidence / "runs" / "agent-failure" / "run.json"
+            write_json(
+                run_path,
+                {
+                    "command": "agent-replay",
+                    "status": "failed",
+                    "error": secret,
+                },
+            )
+            write_json(
+                run_path.parent / "result.json",
+                {
+                    "failure_stage": "fixture-endpoint",
+                    "error_type": "HTTPError",
+                    "cleanup_error_type": "AgentStopUnconfirmed",
+                    "cleanup_failure_stage": "agent-stop",
+                    "agent_stopped": False,
+                    "prompt": secret,
+                    "api_key": secret,
+                },
+            )
+            detail = agent_replay_failure_diagnostic(self.campaign.evidence, set())
+            self.assertEqual(
+                detail,
+                {
+                    "status": "UNKNOWN",
+                    "failure_stage": "fixture-endpoint",
+                    "error_type": "HTTPError",
+                    "cleanup_error_type": "AgentStopUnconfirmed",
+                    "cleanup_failure_stage": "agent-stop",
+                    "agent_stopped": False,
+                },
+            )
+            published = campaign_failure_diagnostic(
+                {"stories": [], "agent_replay": detail}, "agent-fixture-replay"
+            )
+            encoded = json.dumps(published)
+            self.assertEqual(
+                published["agent_replay_diagnostic"],
+                {
+                    "failure_stage": "fixture-endpoint",
+                    "error_type": "HTTPError",
+                    "cleanup_error_type": "AgentStopUnconfirmed",
+                    "cleanup_failure_stage": "agent-stop",
+                    "agent_stopped": False,
+                },
+            )
+            self.assertNotIn(secret, encoded)
+            self.assertNotIn("api_key", encoded)
+
         def test_semantic_mcp_repeatability_ignores_actor_ids_not_cart_mismatch(self):
             first = {
                 "story": "mcp-session-id",
@@ -2438,6 +2575,7 @@ def main(argv=None):
     }
     success = False
     failure_phase = "campaign-preflight"
+    agent_replay_prior_runs = set()
     try:
         if (campaign.state / "state.json").exists() or (campaign.state / "active.json").exists():
             raise ValueError(
@@ -2475,7 +2613,15 @@ def main(argv=None):
             failure_phase = "agent-fixture-replay"
             summary["agent_replay"] = {"status": "RUNNING"}
             write_json(campaign.receipts / "campaign.json", summary)
-            prior_runs = run_agent_replay_command(campaign)
+            agent_replay_prior_runs = set((campaign.evidence / "runs").glob("*/run.json"))
+            try:
+                prior_runs = run_agent_replay_command(campaign)
+            except Exception:
+                summary["agent_replay"] = agent_replay_failure_diagnostic(
+                    campaign.evidence, agent_replay_prior_runs
+                )
+                write_json(campaign.receipts / "campaign.json", summary)
+                raise
             new_runs = {
                 path
                 for path in set((campaign.evidence / "runs").glob("*/run.json")) - prior_runs
