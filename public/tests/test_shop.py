@@ -1240,6 +1240,9 @@ class StoryOutcomeControls(unittest.TestCase):
                 )
                 self.assertEqual(missing["status"], "UNKNOWN")
                 self.assertEqual(missing["reason"], reason)
+                if output == "1\ngA==\n":
+                    self.assertEqual(missing["failure_byte_offset"], 1)
+                    self.assertEqual(missing["failure_payload_bytes"], 1)
         unavailable = shop.read_valkey_cart(
             state, user, lambda _args: (_ for _ in ()).throw(OSError("private command detail"))
         )

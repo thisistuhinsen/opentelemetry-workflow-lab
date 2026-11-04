@@ -896,10 +896,12 @@ def cart_items(value, *, expected_user=None):
 
 
 class ValkeyPayloadError(ValueError):
-    """A protobuf failure with a fixed, non-sensitive diagnostic code."""
+    """A protobuf failure with a fixed code; byte_offset is the parser cursor."""
 
-    def __init__(self, code):
+    def __init__(self, code, *, byte_offset=None, payload_bytes=None):
         self.code = code
+        self.byte_offset = byte_offset
+        self.payload_bytes = payload_bytes
         super().__init__(code)
 
 
@@ -907,7 +909,11 @@ def _proto_varint(data, offset, *, context):
     value = 0
     for shift in range(0, 70, 7):
         if offset >= len(data):
-            raise ValkeyPayloadError("protobuf-" + context + "-truncated-varint")
+            raise ValkeyPayloadError(
+                "protobuf-" + context + "-truncated-varint",
+                byte_offset=offset,
+                payload_bytes=len(data),
+            )
         byte = data[offset]
         offset += 1
         value |= (byte & 0x7F) << shift
@@ -1036,7 +1042,11 @@ def read_valkey_cart(state, user, runner=native):
             "config_sha256": hashlib.sha256(Path(state["config"]).read_bytes()).hexdigest(),
         }
     except ValkeyPayloadError as error:
-        return {"status": "UNKNOWN", "reason": "valkey-" + error.code}
+        observation = {"status": "UNKNOWN", "reason": "valkey-" + error.code}
+        if error.byte_offset is not None and error.payload_bytes is not None:
+            observation["failure_byte_offset"] = error.byte_offset
+            observation["failure_payload_bytes"] = error.payload_bytes
+        return observation
     except (OSError, TypeError, ValueError, RuntimeError, subprocess.SubprocessError, binascii.Error):
         return {"status": "UNKNOWN", "reason": "valkey-" + phase + "-failed-or-invalid"}
 

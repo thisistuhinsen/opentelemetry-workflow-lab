@@ -876,6 +876,8 @@ def browser_checkout_diagnostic(browser, valkey, comparison):
         "valkey_status": valkey.get("status", "UNKNOWN"),
         "valkey_reason": valkey.get("reason"),
         "valkey_comparison": comparison,
+        "valkey_failure_byte_offset": valkey.get("failure_byte_offset"),
+        "valkey_failure_payload_bytes": valkey.get("failure_payload_bytes"),
     }
 
 
@@ -1514,7 +1516,13 @@ def self_test():
                     "cart_before": [{"product_id": "demo-product", "quantity": 1}],
                     "cart_after": [],
                 },
-                {"status": "UNKNOWN", "reason": "engine identity mismatch", "actor_id": shopper},
+                {
+                    "status": "UNKNOWN",
+                    "reason": "engine identity mismatch",
+                    "actor_id": shopper,
+                    "failure_byte_offset": 1,
+                    "failure_payload_bytes": 1,
+                },
                 "UNKNOWN",
             )
             self.assertEqual(diagnostic["browser_status"], "API_AND_BROWSER_OBSERVED")
@@ -1525,6 +1533,8 @@ def self_test():
             self.assertNotIn(shopper, encoded)
             self.assertNotIn(order, encoded)
             self.assertNotIn("actor_id", diagnostic)
+            self.assertEqual(diagnostic["valkey_failure_byte_offset"], 1)
+            self.assertEqual(diagnostic["valkey_failure_payload_bytes"], 1)
 
         def test_campaign_action_supplies_bound_cart_to_same_world_restart(self):
             user = "shop-11111111-1111-4111-8111-111111111111"
