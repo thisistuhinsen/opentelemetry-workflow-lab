@@ -751,6 +751,7 @@ def scoped_config(
             "MCP_ENDPOINT": "mcp",
             "MCP_PORT": "8011",
             "AGENT_PORT": "8010",
+            "PYTHONPATH": "/app",
             "GRAPH_RECURSION_LIMIT": "6",
             "OTEL_EXPORTER_OTLP_ENDPOINT": "http://otel-collector:4318",
             "OTEL_EXPORTER_OTLP_INSECURE": "true",
@@ -1843,6 +1844,7 @@ AGENT_REPLAY_STAGES = {
 
 AGENT_RUNTIME_GUARD_CHECKS = {
     "imports",
+    "sitecustomize-autoload",
     "vcr-version",
     "vcr-record-mode",
     "replay-only-flag",
@@ -2019,11 +2021,14 @@ def run_agent_replay(state, directory, runner=native, http=request):
         if internal.lower() != "true":
             raise RuntimeError("Agent replay network is not Docker-internal; no prompt was sent.")
         mark_stage("runtime-guard")
-        verify_script = r"""import hashlib,json,os
+        verify_script = r"""import hashlib,json,os,sys
 check='imports'
 try:
  import vcr
  from src.agents.patch_vcr import VCR
+ check='sitecustomize-autoload'
+ overlay=sys.modules.get('sitecustomize')
+ if overlay is None or os.path.realpath(getattr(overlay,'__file__','')) != '/app/sitecustomize.py': raise RuntimeError
  check='vcr-version'
  if vcr.__version__ != '8.3.0': raise RuntimeError
  check='vcr-record-mode'

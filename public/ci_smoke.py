@@ -985,6 +985,12 @@ def campaign_failure_diagnostic(summary, phase):
             error_type = agent.get(field)
             if isinstance(error_type, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", error_type):
                 agent_detail[field] = error_type
+        guard_check = agent.get("runtime_guard_check")
+        if isinstance(guard_check, str) and guard_check in shop_app.AGENT_RUNTIME_GUARD_CHECKS:
+            agent_detail["runtime_guard_check"] = guard_check
+        guard_error_type = agent.get("runtime_guard_error_type")
+        if isinstance(guard_error_type, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", guard_error_type):
+            agent_detail["runtime_guard_error_type"] = guard_error_type
         if type(agent.get("agent_stopped")) is bool:
             agent_detail["agent_stopped"] = agent["agent_stopped"]
         if agent_detail:
@@ -1070,6 +1076,12 @@ def agent_replay_failure_diagnostic(evidence, prior_runs):
         error_type = result.get(field)
         if isinstance(error_type, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", error_type):
             diagnostic[field] = error_type
+    guard_check = result.get("runtime_guard_check")
+    if isinstance(guard_check, str) and guard_check in shop_app.AGENT_RUNTIME_GUARD_CHECKS:
+        diagnostic["runtime_guard_check"] = guard_check
+    guard_error_type = result.get("runtime_guard_error_type")
+    if isinstance(guard_error_type, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", guard_error_type):
+        diagnostic["runtime_guard_error_type"] = guard_error_type
     if type(result.get("agent_stopped")) is bool:
         diagnostic["agent_stopped"] = result["agent_stopped"]
     return diagnostic

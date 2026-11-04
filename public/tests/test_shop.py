@@ -86,6 +86,12 @@ class ShopControls(unittest.TestCase):
         )
         self.assertEqual(
             shop.agent_runtime_guard_failure(
+                {"status": "UNKNOWN", "failed_check": "sitecustomize-autoload"}, "a" * 64
+            ),
+            {"runtime_guard_check": "sitecustomize-autoload"},
+        )
+        self.assertEqual(
+            shop.agent_runtime_guard_failure(
                 {
                     "status": "PASS",
                     "vcrpy": shop.AGENT_VCRPY_VERSION,
@@ -256,6 +262,7 @@ class ShopControls(unittest.TestCase):
         self.assertEqual(agent["environment"]["VCR_MATCH_THRESHOLD"], "1.0")
         self.assertEqual(agent["environment"]["LLM_BASE_URL"], "http://127.0.0.1:9/v1")
         self.assertEqual(agent["environment"]["API_KEY"], "sk-dummy")
+        self.assertEqual(agent["environment"]["PYTHONPATH"], "/app")
         self.assertNotIn("AZURE_OPENAI_API_KEY", agent["environment"])
         self.assertNotIn("OPENAI_ORG_ID", agent["environment"])
         self.assertEqual(agent["environment"]["FLAGD_HOST"], "flagd")

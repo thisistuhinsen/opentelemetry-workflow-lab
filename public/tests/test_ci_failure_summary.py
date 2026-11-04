@@ -86,6 +86,8 @@ class FailureSummaryTests(unittest.TestCase):
                         "result": {
                             "failure_stage": "fixture-endpoint",
                             "error_type": "HTTPError",
+                            "runtime_guard_check": "vcr-record-mode",
+                            "runtime_guard_error_type": "RuntimeError",
                             "prompt": secret,
                             "api_key": secret,
                         },
@@ -111,7 +113,8 @@ class FailureSummaryTests(unittest.TestCase):
                 output,
             )
             self.assertIn(
-                'agent_replay={"error_type":"HTTPError","failure_stage":"fixture-endpoint"}',
+                'agent_replay={"error_type":"HTTPError","failure_stage":"fixture-endpoint",'
+                '"runtime_guard_check":"vcr-record-mode","runtime_guard_error_type":"RuntimeError"}',
                 output,
             )
             self.assertNotIn(secret, output)
