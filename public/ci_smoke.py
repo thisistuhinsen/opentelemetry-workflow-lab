@@ -26,6 +26,28 @@ def timestamp():
     return dt.datetime.now(dt.UTC).isoformat()
 
 
+def safe_failure_detail(value, limit=240):
+    """Bound and redact a single already-redacted CLI error for CI logs."""
+    if not isinstance(value, str) or not value.strip():
+        return "detail unavailable; inspect the retained evidence artifact"
+    detail = " ".join(value.split())
+    detail = re.sub(r"(?i)\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b", "[email]", detail)
+    detail = re.sub(
+        r"\bshop-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+        "[shopper]",
+        detail,
+    )
+    detail = re.sub(r"\bshop-[0-9a-f]{12}\b", "[project]", detail)
+    detail = re.sub(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)", "[number]", detail)
+    detail = re.sub(
+        r"(?i)\b(authorization|password|token|secret)\s*[:=]\s*(?:(?:bearer|basic)\s+)?\S+",
+        r"\1=[redacted]",
+        detail,
+    )
+    detail = re.sub(r"\s+", " ", detail).strip()
+    return detail[:limit]
+
+
 def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -570,6 +592,7 @@ class Campaign:
     def cli(self, *arguments):
         self.sequence += 1
         stem = "command-" + str(self.sequence).zfill(3)
+        prior_runs = set((self.evidence / "runs").glob("*/run.json"))
         argv = [
             sys.executable,
             str(PUBLIC / "shop.py"),
@@ -594,10 +617,48 @@ class Campaign:
                 )
             record["exit_code"] = result.returncode
             if result.returncode:
+                failed = self._new_failed_run_summary(prior_runs)
+                if failed:
+                    print("Shop CI detail: " + failed, file=sys.stderr, flush=True)
                 raise RuntimeError("Shop step failed: " + " ".join(arguments) + "; inspect " + record["log"])
         finally:
             record.update(completed_utc=timestamp(), duration_seconds=time.monotonic() - start)
             write_json(self.receipts / (stem + ".json"), record)
+
+    def _new_failed_run_summary(self, prior_runs):
+        runs = self.evidence / "runs"
+        if not runs.is_dir():
+            return ""
+        fresh = sorted(set(runs.glob("*/run.json")) - prior_runs)
+        if len(fresh) != 1:
+            return ""
+        path = fresh[0]
+        if (
+            path.is_symlink()
+            or not path.resolve().is_relative_to(self.evidence)
+            or not path.is_file()
+            or path.stat().st_size > 65536
+        ):
+            return ""
+        try:
+            run = read_json(path)
+        except (OSError, ValueError):
+            return ""
+        if not isinstance(run, dict) or run.get("status") != "failed":
+            return ""
+        command = run.get("command")
+        if not isinstance(command, str) or command not in {
+            "setup",
+            "start",
+            "story",
+            "reset",
+            "replay",
+            "stop",
+            "clean",
+        }:
+            return ""
+        detail = safe_failure_detail(run.get("error"))
+        return f"phase={command} status=failed error={detail}"
 
     def action(self, command, story):
         runs = self.evidence / "runs"
