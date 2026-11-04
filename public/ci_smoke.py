@@ -859,6 +859,26 @@ def validate_agent_replay_result(run_record, result, *, expected_overlay_sha256)
     )
 
 
+def browser_checkout_diagnostic(browser, valkey, comparison):
+    """Return a bounded, identity-free diagnostic suitable for ordinary CI logs."""
+    browser = browser if isinstance(browser, dict) else {}
+    valkey = valkey if isinstance(valkey, dict) else {}
+    before = browser.get("cart_before")
+    after = browser.get("cart_after")
+    return {
+        "browser_status": browser.get("status", "UNKNOWN"),
+        "checkout_request_count": browser.get("checkout_request_count"),
+        "checkout_http_status": browser.get("checkout_HTTP_status"),
+        "order_response_present": browser.get("order_response_present"),
+        "cart_http_status": browser.get("cart_HTTP_status"),
+        "cart_before_item_count": len(before) if isinstance(before, list) else None,
+        "cart_after_item_count": len(after) if isinstance(after, list) else None,
+        "valkey_status": valkey.get("status", "UNKNOWN"),
+        "valkey_reason": valkey.get("reason"),
+        "valkey_comparison": comparison,
+    }
+
+
 def run_browser_checkout(state, *, on_prepared, on_dispatch, browser_timeout_ms=30000):
     """Perform one real Chromium checkout with fictional data and loopback-only requests."""
     from playwright.sync_api import sync_playwright
@@ -1478,6 +1498,33 @@ def self_test():
             self.assertEqual(contradictory["actors"][user_a]["comparison"], "CONTRADICTED")
             with self.assertRaises(RuntimeError):
                 observe_store_for_result({**state, "project": "shop-aaaaaaaaaaaa"}, result, runner=runner)
+
+        def test_browser_checkout_diagnostic_is_bounded_and_identity_free(self):
+            shopper = "shop-11111111-1111-4111-8111-111111111111"
+            order = "private-order-id"
+            diagnostic = browser_checkout_diagnostic(
+                {
+                    "status": "API_AND_BROWSER_OBSERVED",
+                    "synthetic_shopper_id": shopper,
+                    "order_id": order,
+                    "checkout_request_count": 1,
+                    "checkout_HTTP_status": 200,
+                    "order_response_present": True,
+                    "cart_HTTP_status": 200,
+                    "cart_before": [{"product_id": "demo-product", "quantity": 1}],
+                    "cart_after": [],
+                },
+                {"status": "UNKNOWN", "reason": "engine identity mismatch", "actor_id": shopper},
+                "UNKNOWN",
+            )
+            self.assertEqual(diagnostic["browser_status"], "API_AND_BROWSER_OBSERVED")
+            self.assertEqual(diagnostic["valkey_status"], "UNKNOWN")
+            self.assertEqual(diagnostic["cart_before_item_count"], 1)
+            self.assertEqual(diagnostic["cart_after_item_count"], 0)
+            encoded = json.dumps(diagnostic)
+            self.assertNotIn(shopper, encoded)
+            self.assertNotIn(order, encoded)
+            self.assertNotIn("actor_id", diagnostic)
 
         def test_campaign_action_supplies_bound_cart_to_same_world_restart(self):
             user = "shop-11111111-1111-4111-8111-111111111111"
@@ -2248,6 +2295,13 @@ def main(argv=None):
         browser_observation = shop_app.read_valkey_cart(browser_state, browser_result["synthetic_shopper_id"])
         browser_comparison = shop_app.compare_valkey_cart(
             browser_result["synthetic_shopper_id"], browser_result.get("cart_after"), browser_observation
+        )
+        browser_diagnostic = browser_checkout_diagnostic(
+            browser_result, browser_observation, browser_comparison
+        )
+        summary["browser_checkout_diagnostic"] = browser_diagnostic
+        print(
+            "Shop CI browser-checkout-summary: " + json.dumps(browser_diagnostic, sort_keys=True), flush=True
         )
         browser_result["independent_valkey_observation"] = {
             **browser_observation,
