@@ -230,9 +230,10 @@ class NativeProcessTests(unittest.TestCase):
         pid = 41237
         token = "a" * 32
         state_file, argv = self._write_external_watcher_identity(self.root / "run with spaces", pid, token)
-        with patch.object(processes.sys, "platform", "darwin"), patch.object(
-            processes.subprocess, "check_output", return_value=" ".join(argv)
-        ) as check_output:
+        with (
+            patch.object(processes.sys, "platform", "darwin"),
+            patch.object(processes.subprocess, "check_output", return_value=" ".join(argv)) as check_output,
+        ):
             self.assertTrue(processes.watcher_matches(pid, state_file))
         check_output.assert_called_once_with(
             ["ps", "-ww", "-p", str(pid), "-o", "command="], text=True, errors="replace", timeout=10
@@ -242,8 +243,9 @@ class NativeProcessTests(unittest.TestCase):
         pid = 41238
         state_file, argv = self._write_external_watcher_identity(self.root / "run", pid, "b" * 32)
         observed = " ".join(argv[:-1] + ["c" * 32])
-        with patch.object(processes.sys, "platform", "darwin"), patch.object(
-            processes.subprocess, "check_output", return_value=observed
+        with (
+            patch.object(processes.sys, "platform", "darwin"),
+            patch.object(processes.subprocess, "check_output", return_value=observed),
         ):
             self.assertFalse(processes.watcher_matches(pid, state_file))
 
@@ -257,7 +259,10 @@ class NativeProcessTests(unittest.TestCase):
                 raise FileNotFoundError(path)
             return original_read_bytes(path)
 
-        with patch.object(processes.sys, "platform", "linux"), patch.object(Path, "read_bytes", stale_proc_entry):
+        with (
+            patch.object(processes.sys, "platform", "linux"),
+            patch.object(Path, "read_bytes", stale_proc_entry),
+        ):
             self.assertFalse(processes.watcher_matches(pid, state_file))
 
     def test_windows_commandline_matching_keeps_windows_quoting(self):
@@ -286,19 +291,24 @@ class NativeProcessTests(unittest.TestCase):
         pid = 41247
         state_file, _ = self._write_external_watcher_identity(self.root / "windows run", pid, "7" * 32)
         with patch.object(processes.subprocess, "check_output", return_value="UNREADABLE"):
-            self.assertEqual(("unknown", "7" * 32), processes._external_watcher_identity(pid, state_file, "win32"))
+            self.assertEqual(
+                ("unknown", "7" * 32), processes._external_watcher_identity(pid, state_file, "win32")
+            )
 
     def test_windows_missing_pid_is_stopped(self):
         pid = 41248
         state_file, _ = self._write_external_watcher_identity(self.root / "windows run", pid, "6" * 32)
         with patch.object(processes.subprocess, "check_output", return_value="MISSING"):
-            self.assertEqual(("stopped", "6" * 32), processes._external_watcher_identity(pid, state_file, "win32"))
+            self.assertEqual(
+                ("stopped", "6" * 32), processes._external_watcher_identity(pid, state_file, "win32")
+            )
 
     def test_ready_marker_for_wrong_pid_is_not_owned_or_probed(self):
         state_file, _ = self._write_external_watcher_identity(self.root / "run", 41240, "d" * 32)
-        with patch.object(processes.sys, "platform", "darwin"), patch.object(
-            processes.subprocess, "check_output"
-        ) as check_output:
+        with (
+            patch.object(processes.sys, "platform", "darwin"),
+            patch.object(processes.subprocess, "check_output") as check_output,
+        ):
             self.assertFalse(processes.watcher_matches(41241, state_file))
         check_output.assert_not_called()
 
@@ -323,9 +333,13 @@ class NativeProcessTests(unittest.TestCase):
     def test_unreadable_watcher_identity_fails_closed_without_stop_signal(self):
         pid = 41243
         state_file, _ = self._write_external_watcher_identity(self.root / "run", pid, "e" * 32)
-        with patch.object(processes.sys, "platform", "darwin"), patch.object(
-            processes.subprocess, "check_output", side_effect=PermissionError("process listing denied")
-        ), patch.object(processes, "_request_stop") as request_stop:
+        with (
+            patch.object(processes.sys, "platform", "darwin"),
+            patch.object(
+                processes.subprocess, "check_output", side_effect=PermissionError("process listing denied")
+            ),
+            patch.object(processes, "_request_stop") as request_stop,
+        ):
             with self.assertRaisesRegex(RuntimeError, "(?i)cannot verify.*watcher|watcher.*cannot verify"):
                 processes.stop_watcher({"log_pid": pid}, state_file.parent)
         request_stop.assert_not_called()
@@ -341,7 +355,10 @@ class NativeProcessTests(unittest.TestCase):
                 raise PermissionError("ready marker unreadable")
             return original_read_text(path, *args, **kwargs)
 
-        with patch.object(Path, "read_text", fail_ready_read), patch.object(processes.sys, "platform", "darwin"):
+        with (
+            patch.object(Path, "read_text", fail_ready_read),
+            patch.object(processes.sys, "platform", "darwin"),
+        ):
             with self.assertRaisesRegex(RuntimeError, "(?i)cannot verify.*watcher|watcher.*cannot verify"):
                 processes.start_watcher({"log_pid": pid}, directory, self.root / "evidence")
 
@@ -363,7 +380,10 @@ class NativeProcessTests(unittest.TestCase):
         process.pid = pid
         processes._WATCHERS[pid] = process
         try:
-            with patch.object(processes, "_request_stop"), patch.object(processes, "_stopped_identity", return_value=False):
+            with (
+                patch.object(processes, "_request_stop"),
+                patch.object(processes, "_stopped_identity", return_value=False),
+            ):
                 with self.assertRaisesRegex(RuntimeError, "terminal marker"):
                     processes.stop_watcher({"log_pid": pid}, state_file.parent)
         finally:

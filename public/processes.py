@@ -446,7 +446,9 @@ def stop_watcher(state, directory):
         if _stopped_identity(state_file, pid, handshake):
             return
         if identity in {"unknown", "mismatched"}:
-            raise RuntimeError("Watcher identity became unprovable during cleanup; no other PID was signaled.")
+            raise RuntimeError(
+                "Watcher identity became unprovable during cleanup; no other PID was signaled."
+            )
         if identity == "stopped":
             raise RuntimeError("Service-log watcher exited without a verified terminal marker.")
         time.sleep(0.1)
