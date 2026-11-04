@@ -87,6 +87,7 @@ def _unique_json(pairs):
 def parse_otlp_traces(path):
     """Validate actual file-exporter envelopes, not debug text or log records."""
     counts = {}
+    checkout_error_users = set()
     lines = 0
     with path.open("r", encoding="utf-8", errors="strict") as stream:
         for line in stream:
@@ -141,13 +142,98 @@ def parse_otlp_traces(path):
                         if not 0 < int(start) <= int(end) < 2**64:
                             raise ValueError("Invalid OTLP span timestamp order.")
                         counts[names[0]] = counts.get(names[0], 0) + 1
+                        if names[0] == "checkout":
+                            status = span.get("status")
+                            attributes = span.get("attributes", [])
+                            matching_users = [
+                                item.get("value", {}).get("stringValue")
+                                for item in attributes
+                                if isinstance(item, dict)
+                                and item.get("key") == "user.id"
+                                and isinstance(item.get("value"), dict)
+                            ]
+                            if (
+                                isinstance(status, dict)
+                                and type(status.get("code")) is int
+                                and status["code"] == 2
+                                and len(matching_users) == 1
+                                and isinstance(matching_users[0], str)
+                                and matching_users[0].strip()
+                            ):
+                                checkout_error_users.add(matching_users[0])
     if not lines or not counts:
         raise ValueError("No exported OTLP spans.")
     return {
         "observed_span_count": sum(counts.values()),
         "service_counts": dict(sorted(counts.items())),
+        "checkout_error_user_ids": sorted(checkout_error_users),
         "jsonl_lines": lines,
     }
+
+
+def payment_story_observations(evidence, project, story_results):
+    observations = []
+    recorded_paths = set()
+    for action in story_results:
+        if action.get("story") != "payment-unreachable" or action.get("project_id") != project:
+            continue
+        run_relative = Path(action.get("run", ""))
+        if run_relative.is_absolute() or not run_relative.parts or ".." in run_relative.parts:
+            raise ValueError("Payment-unavailable action has an unsafe run reference.")
+        run_path = evidence / run_relative
+        result_path = run_path.parent / "result.json"
+        run_file = file_binding(evidence, run_path)
+        result_file = file_binding(evidence, result_path)
+        if run_file["sha256"] != action.get("run_sha256") or result_file["sha256"] != action.get(
+            "result_sha256"
+        ):
+            raise ValueError("Payment-unavailable action no longer matches its recorded result hashes.")
+        recorded_paths.add(result_path.resolve())
+        result = read_json(result_path)
+        before = result.get("cart_before")
+        after = result.get("cart_after")
+        shopper = result.get("synthetic_shopper_id")
+        item_is_single_demo_item = (
+            isinstance(before, list)
+            and len(before) == 1
+            and isinstance(before[0], dict)
+            and isinstance(before[0].get("product_id"), str)
+            and bool(before[0]["product_id"])
+            and type(before[0].get("quantity")) is int
+            and before[0]["quantity"] == 1
+        )
+        valid = (
+            isinstance(shopper, str)
+            and re.fullmatch(
+                r"shop-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", shopper
+            )
+            and result.get("project_id") == project
+            and result.get("story") == "payment-unreachable"
+            and action.get("synthetic_shopper_id") == shopper
+            and type(action.get("checkout_attempt_count")) is int
+            and action["checkout_attempt_count"] == 1
+            and type(result.get("checkout_attempt_count")) is int
+            and result["checkout_attempt_count"] == 1
+            and type(result.get("checkout_HTTP_status")) is int
+            and 400 <= result["checkout_HTTP_status"] <= 599
+            and result.get("order_response_present") is False
+            and type(result.get("cart_HTTP_status")) is int
+            and result["cart_HTTP_status"] == 200
+            and item_is_single_demo_item
+            and before == after
+            and result.get("assessment", {}).get("passed") is True
+        )
+        if not valid:
+            raise ValueError(
+                "Payment-unavailable result lacks the one-attempt, error, no-order and cart-readback contract."
+            )
+        observations.append({"synthetic_shopper_id": shopper})
+    for path in sorted((evidence / "runs").glob("*/result.json")):
+        result = read_json(path)
+        if result.get("project_id") == project and result.get("story") == "payment-unreachable":
+            if path.resolve() not in recorded_paths:
+                raise ValueError("Payment-unavailable result is absent from the campaign's action record.")
+    return observations
 
 
 def telemetry_inventory(evidence, projects):
@@ -159,9 +245,32 @@ def telemetry_inventory(evidence, projects):
         try:
             row.update(file_binding(evidence, path))
             row.update(parse_otlp_traces(path))
+            campaign_path = evidence / "ci" / "campaign.json"
+            campaign = read_json(campaign_path) if campaign_path.is_file() else {}
+            story_results = campaign.get("story_results", [])
+            if not isinstance(story_results, list):
+                raise ValueError("Campaign story-results record is malformed.")
+            payment_observations = payment_story_observations(evidence, project, story_results)
+            checkout_error_users = set(row["checkout_error_user_ids"])
+            row["payment_unavailable_observations"] = [
+                {
+                    "synthetic_shopper_id": item["synthetic_shopper_id"],
+                    "direct_error_response_and_cart_readback": True,
+                    "one_checkout_dispatch_recorded": True,
+                    "matching_checkout_error_span_observed": item["synthetic_shopper_id"]
+                    in checkout_error_users,
+                    "basis": "synthetic API response and cart readback joined to a positive checkout OTel error span; no settlement claim",
+                }
+                for item in payment_observations
+            ]
+            if any(
+                not item["matching_checkout_error_span_observed"]
+                for item in row["payment_unavailable_observations"]
+            ):
+                raise ValueError("Payment-unavailable result has no matching positive checkout error span.")
             row["status"] = "OBSERVED_EXPORTED_SPANS"
         except (OSError, ValueError, TypeError, AttributeError, OverflowError):
-            row["error"] = "Missing, empty, malformed, or redirected OTLP file; no trace qualification."
+            row["error"] = "Missing or invalid trace/result binding; no telemetry qualification."
         records.append(row)
         if directory.exists():
             files.extend(
@@ -456,6 +565,9 @@ class Campaign:
             "run_sha256": sha256(run_path),
             "result_sha256": sha256(result_path),
             "assessment": result["assessment"],
+            "project_id": result.get("project_id"),
+            "synthetic_shopper_id": result.get("synthetic_shopper_id"),
+            "checkout_attempt_count": result.get("checkout_attempt_count"),
         }
 
     def cleanup(self):
@@ -681,6 +793,122 @@ def self_test():
             self.assertEqual(row["service_counts"], {"frontend": 2})
             self.assertEqual(row["sha256"], sha256(path))
             self.assertEqual(row["bytes"], path.stat().st_size)
+
+        def payment_result(self, project, shopper, **changes):
+            result = {
+                "story": "payment-unreachable",
+                "project_id": project,
+                "synthetic_shopper_id": shopper,
+                "checkout_attempt_count": 1,
+                "checkout_HTTP_status": 500,
+                "order_response_present": False,
+                "cart_HTTP_status": 200,
+                "cart_before": [{"product_id": "demo-product", "quantity": 1}],
+                "cart_after": [{"product_id": "demo-product", "quantity": 1}],
+                "assessment": {"passed": True},
+            }
+            result.update(changes)
+            path = self.campaign.evidence / "runs" / "payment-run" / "result.json"
+            path.parent.mkdir(parents=True)
+            write_json(path, result)
+            run_path = path.parent / "run.json"
+            write_json(run_path, {"status": "passed", "command": "story"})
+            action = {
+                "story": "payment-unreachable",
+                "command": ["story", "payment-unreachable"],
+                "run": run_path.relative_to(self.campaign.evidence).as_posix(),
+                "run_sha256": sha256(run_path),
+                "result_sha256": sha256(path),
+                "assessment": result["assessment"],
+                "project_id": project,
+                "synthetic_shopper_id": shopper,
+                "checkout_attempt_count": result["checkout_attempt_count"],
+            }
+            write_json(self.campaign.evidence / "ci" / "campaign.json", {"story_results": [action]})
+            return path
+
+        def checkout_error_trace(self, path, record, shopper, *, status_code=2):
+            span = {
+                "name": "oteldemo.CheckoutService/PlaceOrder",
+                "traceId": "3" * 32,
+                "spanId": "4" * 16,
+                "startTimeUnixNano": "300",
+                "endTimeUnixNano": "400",
+                "attributes": [{"key": "user.id", "value": {"stringValue": shopper}}],
+                "status": {"code": status_code},
+            }
+            record["resourceSpans"].append(
+                {
+                    "resource": {
+                        "attributes": [{"key": "service.name", "value": {"stringValue": "checkout"}}]
+                    },
+                    "scopeSpans": [{"spans": [span]}],
+                }
+            )
+            path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        def test_payment_unavailable_joins_direct_observation_to_positive_checkout_error_span(self):
+            path, record = self.trace()
+            project = "shop-" + "c" * 12
+            shopper = "shop-11111111-1111-4111-8111-111111111111"
+            self.payment_result(project, shopper)
+            self.checkout_error_trace(path, record, shopper)
+            result = telemetry_inventory(self.campaign.evidence, recorded_projects(self.campaign.state))
+            self.assertEqual(result["status"], "PASS")
+            observation = result["projects"][0]["payment_unavailable_observations"][0]
+            self.assertTrue(observation["direct_error_response_and_cart_readback"])
+            self.assertTrue(observation["one_checkout_dispatch_recorded"])
+            self.assertTrue(observation["matching_checkout_error_span_observed"])
+
+        def test_missing_or_wrong_checkout_error_span_does_not_pass_payment_story(self):
+            path, record = self.trace()
+            project = "shop-" + "c" * 12
+            shopper = "shop-11111111-1111-4111-8111-111111111111"
+            self.payment_result(project, shopper)
+            self.checkout_error_trace(path, record, "shop-22222222-2222-4222-8222-222222222222")
+            result = telemetry_inventory(self.campaign.evidence, recorded_projects(self.campaign.state))
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(result["projects"][0]["status"], "UNKNOWN")
+
+        def test_non_error_checkout_span_does_not_qualify_payment_story(self):
+            path, record = self.trace()
+            project = "shop-" + "c" * 12
+            shopper = "shop-11111111-1111-4111-8111-111111111111"
+            self.payment_result(project, shopper)
+            self.checkout_error_trace(path, record, shopper, status_code=1)
+            result = telemetry_inventory(self.campaign.evidence, recorded_projects(self.campaign.state))
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(result["projects"][0]["status"], "UNKNOWN")
+
+        def test_inconsistent_payment_result_contract_is_unknown(self):
+            path, record = self.trace()
+            project = "shop-" + "c" * 12
+            shopper = "shop-11111111-1111-4111-8111-111111111111"
+            self.payment_result(project, shopper, checkout_attempt_count=2)
+            self.checkout_error_trace(path, record, shopper)
+            result = telemetry_inventory(self.campaign.evidence, recorded_projects(self.campaign.state))
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(result["projects"][0]["status"], "UNKNOWN")
+
+        def test_payment_result_requires_campaign_hash_link_and_action_record(self):
+            path, record = self.trace()
+            project = "shop-" + "c" * 12
+            shopper = "shop-11111111-1111-4111-8111-111111111111"
+            self.payment_result(project, shopper)
+            self.checkout_error_trace(path, record, shopper)
+            campaign_path = self.campaign.evidence / "ci" / "campaign.json"
+            campaign = read_json(campaign_path)
+            campaign["story_results"][0]["result_sha256"] = "0" * 64
+            write_json(campaign_path, campaign)
+            result = telemetry_inventory(self.campaign.evidence, recorded_projects(self.campaign.state))
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(result["projects"][0]["status"], "UNKNOWN")
+
+            campaign["story_results"] = []
+            write_json(campaign_path, campaign)
+            result = telemetry_inventory(self.campaign.evidence, recorded_projects(self.campaign.state))
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(result["projects"][0]["status"], "UNKNOWN")
 
         def test_debug_empty_malformed_and_invalid_span_lines_reject(self):
             path, record = self.trace()

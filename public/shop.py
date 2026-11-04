@@ -17,6 +17,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 try:
     from .source_integrity import verify_source
@@ -89,15 +90,29 @@ def assess_story(story, outcome):
         and bool(before[0]["product_id"])
     )
     code = outcome.get("checkout_HTTP_status", 0)
+    one_checkout = (
+        type(outcome.get("checkout_attempt_count")) is int and outcome["checkout_attempt_count"] == 1
+    )
     if expected == "success-empty":
-        passed = positive and code == 200 and outcome.get("order_response_present") is True and after == []
+        passed = (
+            one_checkout
+            and positive
+            and code == 200
+            and outcome.get("order_response_present") is True
+            and after == []
+        )
     elif expected == "success-retained":
         passed = (
-            positive and code == 200 and outcome.get("order_response_present") is True and after == before
+            one_checkout
+            and positive
+            and code == 200
+            and outcome.get("order_response_present") is True
+            and after == before
         )
     elif expected == "error-retained":
         passed = (
-            positive
+            one_checkout
+            and positive
             and isinstance(code, int)
             and 400 <= code <= 599
             and not outcome.get("order_response_present")
@@ -117,6 +132,11 @@ def assess_story(story, outcome):
     return {"passed": bool(passed), "expected": expected, "description": STORIES[story]["description"]}
 
 
+def is_checkout_dispatch(method, path):
+    """Classify only the sample's business checkout POST, not telemetry exports."""
+    return method.upper() == "POST" and urlsplit(path).path == "/api/checkout"
+
+
 def prepare_envoy(workspace, directory):
     text = (workspace / "src/frontend-proxy/envoy.tmpl.yaml").read_text(encoding="utf-8")
     marker = '                        - match: { prefix: "/" }'
@@ -125,6 +145,8 @@ def prepare_envoy(workspace, directory):
     route = (
         '                        - match: { path: "/api/checkout" }\n'
         f"                          route: {{ cluster: frontend, timeout: {PROFILE['proxy_checkout_seconds']}s, idle_timeout: {PROFILE['proxy_idle_seconds']}s }}\n"
+        '                        - match: { path: "/api/cart" }\n'
+        f"                          route: {{ cluster: frontend, timeout: {PROFILE['proxy_read_seconds']}s, idle_timeout: {PROFILE['proxy_idle_seconds']}s }}\n"
     )
     target = directory / "envoy.tmpl.yaml"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -603,7 +625,7 @@ def request(port, method, path, body=None):
         "127.0.0.1",
         port,
         timeout=PROFILE["checkout_http_seconds"]
-        if method == "POST" and path.startswith("/api/checkout")
+        if is_checkout_dispatch(method, path)
         else PROFILE["read_http_seconds"],
     )
     try:
@@ -802,14 +824,23 @@ asyncio.run(main())
         claim_checkout(directory / "checkout-claims", user)
         state["users"][user] = {"status": "UNKNOWN_AFTER_DISPATCH"}
         write_json(directory / "state.json", state)
-        status, response = http(
-            state["http_port"], "POST", "/api/checkout?currencyCode=USD", {"userId": user, **person}
-        )
+        checkout_attempt_count = 0
+
+        def dispatch(method, path, body):
+            nonlocal checkout_attempt_count
+            if is_checkout_dispatch(method, path):
+                checkout_attempt_count += 1
+            return http(state["http_port"], method, path, body)
+
+        status, response = dispatch("POST", "/api/checkout?currencyCode=USD", {"userId": user, **person})
         after_status, after = http(
             state["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD"
         )
         outcome = {
             "story": story,
+            "project_id": state["project"],
+            "synthetic_shopper_id": user,
+            "checkout_attempt_count": checkout_attempt_count,
             "checkout_HTTP_status": status,
             "order_response_present": isinstance(response, dict) and bool(response.get("orderId")),
             "cart_HTTP_status": after_status,

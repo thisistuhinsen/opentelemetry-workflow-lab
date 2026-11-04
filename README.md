@@ -32,7 +32,7 @@ shop.cmd clean
 |---|---|---|
 | normal | Add one item, then check out | Order response and empty cart |
 | cart-failure | Enable the demo cart-clear fault, then check out | Order response but the item remains; this demonstrates the fault |
-| payment-unreachable | Enable the demo payment-unavailable flag | Error response and retained cart |
+| payment-unreachable | Enable the demo payment-unavailable flag | Exactly one checkout request, an error response without an order, and an independently read retained cart; CI also joins the synthetic shopper to a positive checkout error span |
 | mcp-session-id | Read one shopper's cart through HTTP and MCP | Matching item identity and quantity |
 
 A case passes when its stated observation is reproduced. A harmful case passing does not mean its business behavior is correct. These observations do not establish settlement, fulfillment, durable deduplication or safe retry. A failed or ambiguous attempt remains recorded.

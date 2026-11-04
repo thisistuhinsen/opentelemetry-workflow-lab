@@ -15,5 +15,6 @@
   "checkout_http_seconds": 420,
   "read_http_seconds": 90,
   "proxy_checkout_seconds": 360,
+  "proxy_read_seconds": 90,
   "proxy_idle_seconds": 480
 }

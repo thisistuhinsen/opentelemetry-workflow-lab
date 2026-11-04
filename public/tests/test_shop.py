@@ -561,6 +561,10 @@ class ShopControls(unittest.TestCase):
             state = json.loads((root / "state.json").read_bytes())
             self.assertEqual(len(state["users"]), 1)
             self.assertEqual(state["users"][state["last_user"]]["status"], "OBSERVED")
+            result = json.loads((root / ("result-" + state["last_user"] + ".json")).read_bytes())
+            self.assertEqual(result["checkout_attempt_count"], 1)
+            self.assertEqual(result["project_id"], state["project"])
+            self.assertEqual(result["synthetic_shopper_id"], state["last_user"])
             self.assertEqual(
                 len([x for x in requests if x[0] == "POST" and x[1].startswith("/api/checkout")]), 1
             )
@@ -651,9 +655,33 @@ class PublicMcpBuildControls(unittest.TestCase):
 
 
 class StoryOutcomeControls(unittest.TestCase):
+    def test_checkout_dispatch_is_exact_and_excludes_telemetry_posts(self):
+        shop = ShopControls().module()
+        self.assertTrue(shop.is_checkout_dispatch("POST", "/api/checkout?currencyCode=USD"))
+        self.assertFalse(shop.is_checkout_dispatch("POST", "/v1/traces"))
+        self.assertFalse(shop.is_checkout_dispatch("POST", "/api/checkout/telemetry"))
+        self.assertFalse(shop.is_checkout_dispatch("GET", "/api/checkout"))
+
+    def test_proxy_gives_cart_readback_an_explicit_timeout_before_catch_all(self):
+        shop = ShopControls().module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "src/frontend-proxy/envoy.tmpl.yaml"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                '                        - match: { prefix: "/" }\n                          route: { cluster: frontend }\n'
+            )
+            rendered = shop.prepare_envoy(root, root / "generated").read_text()
+            cart = rendered.index('path: "/api/cart"')
+            catch_all = rendered.index('prefix: "/"')
+            self.assertLess(cart, catch_all)
+            self.assertIn(f"timeout: {shop.PROFILE['proxy_read_seconds']}s", rendered[cart:catch_all])
+            self.assertIn('path: "/api/checkout"', rendered)
+
     def test_failed_cart_read_cannot_look_like_an_empty_cart(self):
         shop = ShopControls().module()
         outcome = {
+            "checkout_attempt_count": 1,
             "checkout_HTTP_status": 200,
             "order_response_present": True,
             "cart_HTTP_status": 503,
@@ -666,6 +694,7 @@ class StoryOutcomeControls(unittest.TestCase):
         shop = ShopControls().module()
         item = [{"product_id": "demo", "quantity": 1}]
         outcome = {
+            "checkout_attempt_count": 1,
             "cart_HTTP_status": 200,
             "checkout_HTTP_status": 200,
             "order_response_present": True,
@@ -684,6 +713,7 @@ class StoryOutcomeControls(unittest.TestCase):
             shop.assess_story(
                 "normal-checkout",
                 {
+                    "checkout_attempt_count": 1,
                     "cart_HTTP_status": 200,
                     "checkout_HTTP_status": 200,
                     "order_response_present": True,
@@ -696,6 +726,7 @@ class StoryOutcomeControls(unittest.TestCase):
             shop.assess_story(
                 "payment-unreachable",
                 {
+                    "checkout_attempt_count": 1,
                     "cart_HTTP_status": 200,
                     "checkout_HTTP_status": 500,
                     "order_response_present": False,
@@ -708,6 +739,7 @@ class StoryOutcomeControls(unittest.TestCase):
             shop.assess_story(
                 "normal-checkout",
                 {
+                    "checkout_attempt_count": 1,
                     "cart_HTTP_status": 200,
                     "checkout_HTTP_status": 200,
                     "order_response_present": True,
@@ -716,6 +748,27 @@ class StoryOutcomeControls(unittest.TestCase):
                 },
             )["passed"]
         )
+
+    def test_checkout_cases_require_exactly_one_attempt_and_no_success_order(self):
+        shop = ShopControls().module()
+        item = [{"product_id": "demo", "quantity": 1}]
+        base = {
+            "checkout_attempt_count": 1,
+            "cart_HTTP_status": 200,
+            "checkout_HTTP_status": 500,
+            "order_response_present": False,
+            "cart_before": item,
+            "cart_after": item,
+        }
+        self.assertTrue(shop.assess_story("payment-unreachable", base)["passed"])
+        for attempts, order_response in ((0, False), (2, False), (True, False), (1, True)):
+            with self.subTest(attempts=attempts, order_response=order_response):
+                outcome = {
+                    **base,
+                    "checkout_attempt_count": attempts,
+                    "order_response_present": order_response,
+                }
+                self.assertFalse(shop.assess_story("payment-unreachable", outcome)["passed"])
 
 
 class NetworkSelectionControls(unittest.TestCase):
