@@ -185,6 +185,32 @@ class ShopControls(unittest.TestCase):
         self.assertTrue(fixture["read_only"])
         self.assertTrue(guard["read_only"])
 
+    def test_agent_replay_summary_is_contained_in_evidence_and_never_overwritten(self):
+        shop = self.module()
+        from evidence import EvidenceRecorder
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "evidence"
+            root.mkdir()
+            state_dir = Path(temporary) / "state"
+            state_dir.mkdir()
+            state = {"project": "shop-0123456789ab"}
+            recorder = EvidenceRecorder(root, "agent-replay")
+
+            result_path = shop.agent_replay_summary_path(state, state_dir, root)
+            result_path.write_text("{}\n", encoding="utf-8")
+            recorder.artifact("Public agent cassette replay summary", result_path)
+            self.assertTrue(result_path.resolve().is_relative_to(root.resolve()))
+            self.assertEqual(
+                recorder._record["artifacts"][0]["href"],
+                "agent-replay/shop-0123456789ab/agent-replay-result.json",
+            )
+
+            with self.assertRaises(FileExistsError):
+                shop.agent_replay_summary_path(state, state_dir, root)
+            with self.assertRaises(ValueError):
+                shop.agent_replay_summary_path({"project": "../escape"}, state_dir, root)
+
     def test_stop_is_exact_project_and_preserves_data(self):
         shop = self.module()
         args = shop.compose_args(

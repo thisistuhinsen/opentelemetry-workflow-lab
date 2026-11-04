@@ -1801,6 +1801,35 @@ def start_owned(state, directory, runner, http):
         )
 
 
+def agent_replay_summary_path(state, directory, evidence_root=None):
+    """Return a fresh summary path; recorded artifacts must live under evidence root."""
+    filename = "agent-replay-result.json"
+    if evidence_root is None:
+        path = Path(directory) / filename
+        if path.exists() or path.is_symlink():
+            raise FileExistsError("Agent replay summary already exists; refusing to overwrite it.")
+        return path
+
+    project = state.get("project")
+    if not isinstance(project, str) or not re.fullmatch(r"shop-[0-9a-f]{12}", project):
+        raise ValueError("Agent replay project identity is invalid.")
+    root = Path(evidence_root).expanduser().resolve()
+    replay_root = root / "agent-replay"
+    if replay_root.is_symlink():
+        raise ValueError("Agent replay evidence folder must not be a symlink.")
+    replay_root.mkdir(exist_ok=True)
+    if not replay_root.resolve().is_relative_to(root):
+        raise ValueError("Agent replay evidence folder escapes the evidence root.")
+    parent = replay_root / project
+    if parent.exists() or parent.is_symlink():
+        raise FileExistsError("Agent replay evidence folder already exists; refusing to overwrite it.")
+    parent.mkdir(exist_ok=False)
+    path = parent / filename
+    if not path.resolve().is_relative_to(root):
+        raise ValueError("Agent replay summary escapes the evidence root.")
+    return path
+
+
 def run_agent_replay(state, directory, runner=native, http=request):
     """Exercise one pinned cassette with a dummy key, loopback endpoint and internal network."""
     if state.get("agent_replay_enabled") is not True:
@@ -1808,7 +1837,11 @@ def run_agent_replay(state, directory, runner=native, http=request):
     verify_world(state, directory)
     overlay = Path(state["agent_replay_overlay"])
     cassette = Path(state["agent_replay_cassette"])
-    result_path = directory / "agent-replay-result.json"
+    result_path = agent_replay_summary_path(
+        state,
+        directory,
+        _RECORDER.root if _RECORDER is not None else None,
+    )
     outcome = {
         "schema": "workflow-lab.agent-replay.v1",
         "status": "UNKNOWN",
