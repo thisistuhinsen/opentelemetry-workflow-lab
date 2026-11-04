@@ -1230,7 +1230,9 @@ class StoryOutcomeControls(unittest.TestCase):
             ("0\n\n", "missing-or-malformed-valkey-readback"),
             ("not-a-count\n\n", "missing-or-malformed-valkey-readback"),
             ("1\n%%%\n", "valkey-base64-decode-failed-or-invalid"),
-            ("1\nAQ==\n", "valkey-protobuf-unsupported-or-duplicate-cart-field"),
+            ("1\ngA==\n", "valkey-protobuf-cart-truncated-varint"),
+            ("1\nAQ==\n", "valkey-protobuf-cart-unsupported-or-duplicate-field"),
+            ("1\nEgGA\n", "valkey-protobuf-cart-item-truncated-varint"),
         ):
             with self.subTest(output=output):
                 missing = shop.read_valkey_cart(

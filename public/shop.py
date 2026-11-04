@@ -903,26 +903,26 @@ class ValkeyPayloadError(ValueError):
         super().__init__(code)
 
 
-def _proto_varint(data, offset):
+def _proto_varint(data, offset, *, context):
     value = 0
     for shift in range(0, 70, 7):
         if offset >= len(data):
-            raise ValkeyPayloadError("protobuf-truncated-varint")
+            raise ValkeyPayloadError("protobuf-" + context + "-truncated-varint")
         byte = data[offset]
         offset += 1
         value |= (byte & 0x7F) << shift
         if byte < 0x80:
             if value > 0xFFFFFFFFFFFFFFFF:
-                raise ValkeyPayloadError("protobuf-varint-out-of-range")
+                raise ValkeyPayloadError("protobuf-" + context + "-varint-out-of-range")
             return value, offset
-    raise ValkeyPayloadError("protobuf-overlong-varint")
+    raise ValkeyPayloadError("protobuf-" + context + "-overlong-varint")
 
 
-def _proto_bytes(data, offset):
-    size, offset = _proto_varint(data, offset)
+def _proto_bytes(data, offset, *, context):
+    size, offset = _proto_varint(data, offset, context=context)
     end = offset + size
     if end > len(data):
-        raise ValkeyPayloadError("protobuf-truncated-field")
+        raise ValkeyPayloadError("protobuf-" + context + "-truncated-field")
     return data[offset:end], end
 
 
@@ -931,17 +931,17 @@ def _decode_cart_item(data):
     quantity = None
     offset = 0
     while offset < len(data):
-        tag, offset = _proto_varint(data, offset)
+        tag, offset = _proto_varint(data, offset, context="cart-item")
         field, wire = tag >> 3, tag & 7
         if field == 1 and wire == 2 and product_id is None:
-            raw, offset = _proto_bytes(data, offset)
+            raw, offset = _proto_bytes(data, offset, context="cart-item")
             product_id = raw.decode("utf-8")
         elif field == 2 and wire == 0 and quantity is None:
-            quantity, offset = _proto_varint(data, offset)
+            quantity, offset = _proto_varint(data, offset, context="cart-item")
         else:
-            raise ValkeyPayloadError("protobuf-item-unsupported-field")
+            raise ValkeyPayloadError("protobuf-cart-item-unsupported-field")
     if not product_id or type(quantity) is not int or not 0 < quantity <= 0x7FFFFFFF:
-        raise ValkeyPayloadError("protobuf-item-incomplete-or-invalid")
+        raise ValkeyPayloadError("protobuf-cart-item-incomplete-or-invalid")
     return {"product_id": product_id, "quantity": quantity}
 
 
@@ -954,19 +954,19 @@ def decode_valkey_cart(data):
     user_id_seen = False
     offset = 0
     while offset < len(data):
-        tag, offset = _proto_varint(data, offset)
+        tag, offset = _proto_varint(data, offset, context="cart")
         field, wire = tag >> 3, tag & 7
         if field == 1 and wire == 2 and not user_id_seen:
-            raw, offset = _proto_bytes(data, offset)
+            raw, offset = _proto_bytes(data, offset, context="cart")
             user_id = raw.decode("utf-8")
             user_id_seen = True
         elif field == 2 and wire == 2:
-            raw, offset = _proto_bytes(data, offset)
+            raw, offset = _proto_bytes(data, offset, context="cart")
             items.append(_decode_cart_item(raw))
         else:
-            raise ValkeyPayloadError("protobuf-unsupported-or-duplicate-cart-field")
+            raise ValkeyPayloadError("protobuf-cart-unsupported-or-duplicate-field")
     if len({item["product_id"] for item in items}) != len(items):
-        raise ValkeyPayloadError("protobuf-duplicate-product-id")
+        raise ValkeyPayloadError("protobuf-cart-duplicate-product-id")
     return {"user_id": user_id, "items": items}
 
 
