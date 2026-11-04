@@ -895,26 +895,34 @@ def cart_items(value, *, expected_user=None):
     return result
 
 
+class ValkeyPayloadError(ValueError):
+    """A protobuf failure with a fixed, non-sensitive diagnostic code."""
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
 def _proto_varint(data, offset):
     value = 0
     for shift in range(0, 70, 7):
         if offset >= len(data):
-            raise ValueError("Truncated Valkey cart protobuf varint.")
+            raise ValkeyPayloadError("protobuf-truncated-varint")
         byte = data[offset]
         offset += 1
         value |= (byte & 0x7F) << shift
         if byte < 0x80:
             if value > 0xFFFFFFFFFFFFFFFF:
-                raise ValueError("Valkey cart protobuf varint is out of range.")
+                raise ValkeyPayloadError("protobuf-varint-out-of-range")
             return value, offset
-    raise ValueError("Valkey cart protobuf varint is overlong.")
+    raise ValkeyPayloadError("protobuf-overlong-varint")
 
 
 def _proto_bytes(data, offset):
     size, offset = _proto_varint(data, offset)
     end = offset + size
     if end > len(data):
-        raise ValueError("Truncated Valkey cart protobuf field.")
+        raise ValkeyPayloadError("protobuf-truncated-field")
     return data[offset:end], end
 
 
@@ -931,16 +939,16 @@ def _decode_cart_item(data):
         elif field == 2 and wire == 0 and quantity is None:
             quantity, offset = _proto_varint(data, offset)
         else:
-            raise ValueError("Valkey cart protobuf item has an unsupported field.")
+            raise ValkeyPayloadError("protobuf-item-unsupported-field")
     if not product_id or type(quantity) is not int or not 0 < quantity <= 0x7FFFFFFF:
-        raise ValueError("Valkey cart protobuf item is incomplete or invalid.")
+        raise ValkeyPayloadError("protobuf-item-incomplete-or-invalid")
     return {"product_id": product_id, "quantity": quantity}
 
 
 def decode_valkey_cart(data):
     """Decode only the Cart/CartItem fields in the pinned upstream demo.proto."""
     if not isinstance(data, bytes) or len(data) > 1_048_576:
-        raise ValueError("Valkey cart protobuf is absent or exceeds the sample bound.")
+        raise ValkeyPayloadError("protobuf-absent-or-over-limit")
     user_id = ""
     items = []
     user_id_seen = False
@@ -956,9 +964,9 @@ def decode_valkey_cart(data):
             raw, offset = _proto_bytes(data, offset)
             items.append(_decode_cart_item(raw))
         else:
-            raise ValueError("Valkey cart protobuf has an unsupported or duplicate field.")
+            raise ValkeyPayloadError("protobuf-unsupported-or-duplicate-cart-field")
     if len({item["product_id"] for item in items}) != len(items):
-        raise ValueError("Valkey cart protobuf has duplicate product IDs.")
+        raise ValkeyPayloadError("protobuf-duplicate-product-id")
     return {"user_id": user_id, "items": items}
 
 
@@ -1027,6 +1035,8 @@ def read_valkey_cart(state, user, runner=native):
             "docker_context": state["docker_context"],
             "config_sha256": hashlib.sha256(Path(state["config"]).read_bytes()).hexdigest(),
         }
+    except ValkeyPayloadError as error:
+        return {"status": "UNKNOWN", "reason": "valkey-" + error.code}
     except (OSError, TypeError, ValueError, RuntimeError, subprocess.SubprocessError, binascii.Error):
         return {"status": "UNKNOWN", "reason": "valkey-" + phase + "-failed-or-invalid"}
 
