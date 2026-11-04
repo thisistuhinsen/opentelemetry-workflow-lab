@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15-intel, windows-2025]
+        os: [ubuntu-24.04, macos-15-intel, macos-15, windows-2025]
     steps:
       - name: Check out sample
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -33,6 +33,29 @@ jobs:
           version: "0.11.6"
           python-version: "3.12"
           enable-cache: false
+      - name: Assert Apple Silicon runner and Python architecture
+        if: matrix.os == 'macos-15'
+        run: |
+          runner_system="$(uname -s)"
+          runner_arch="$(uname -m)"
+          printf 'runner_system=%s\nrunner_arch=%s\n' "$runner_system" "$runner_arch"
+          test "$runner_system" = Darwin
+          test "$runner_arch" = arm64
+          uv run --no-project --python 3.12 python - <<'PY'
+          import platform
+          import sys
+
+          python_system = platform.system()
+          python_machine = platform.machine().lower()
+          python_architecture = platform.architecture()[0]
+          print(f"python_executable={sys.executable}")
+          print(f"python_system={python_system}")
+          print(f"python_machine={python_machine}")
+          print(f"python_architecture={python_architecture}")
+          assert python_system == "Darwin"
+          assert python_machine == "arm64"
+          assert python_architecture == "64bit"
+          PY
       - name: Test native process and watcher lifecycle contracts
         run: uv run --no-project --python 3.12 python -m unittest discover -s public/tests -p test_processes.py -v
 
