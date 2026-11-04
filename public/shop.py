@@ -1074,6 +1074,8 @@ main().catch(error => {
     )
     return {
         "story": "shared-cart-overlap",
+        "project_id": state["project"],
+        "synthetic_shopper_id": user,
         "cart_before": [],
         "cart_after": observed_items,
         "cart_HTTP_status": observer_status,

@@ -20,6 +20,9 @@ from pathlib import Path
 
 PUBLIC = Path(__file__).resolve().parent
 ROOT = PUBLIC.parent
+if str(PUBLIC) not in sys.path:
+    sys.path.insert(0, str(PUBLIC))
+import shop as shop_app  # noqa: E402
 
 
 def timestamp():
@@ -523,6 +526,45 @@ def assert_fresh(before, after, context, *, empty=False):
         raise RuntimeError("Replay reused a previous shopper.")
 
 
+def verify_same_world_restart(before, after, user, status, payload, expected_cart):
+    """Bind a restart readback to the same recorded project and synthetic shopper."""
+    if (
+        before.get("project") != after.get("project")
+        or before.get("config") != after.get("config")
+        or before.get("docker_context") != after.get("docker_context")
+        or before.get("users", {}).get(user, {}).get("status") != "OBSERVED"
+        or after.get("users", {}).get(user, {}).get("status") != "OBSERVED"
+    ):
+        raise RuntimeError("Same-world restart changed the recorded project, context, or settled shopper.")
+    if status != 200:
+        raise RuntimeError("Same-world restart readback is unavailable; persisted cart state is unknown.")
+    items = shop_app.cart_items(payload, expected_user=user)
+    if items != expected_cart:
+        raise RuntimeError("Same-world restart changed or contradicted the recorded cart observation.")
+    return {
+        "project_unchanged": True,
+        "synthetic_shopper_id": user,
+        "cart_HTTP_status": status,
+        "cart_identity_observation": shop_app.cart_identity_status(payload, user),
+        "cart_after_restart": items,
+        "matches_pre_restart_observation": True,
+        "basis": "same recorded project and synthetic shopper; direct HTTP API readback after stop/start",
+    }
+
+
+def observe_same_world_restart(campaign, result, before):
+    user = result.get("synthetic_shopper_id")
+    if not isinstance(user, str) or not user:
+        raise RuntimeError("Restart observation has no recorded synthetic shopper; state is unknown.")
+    campaign.cli("stop")
+    campaign.cli("start")
+    after = active_state(campaign.state)
+    status, payload = shop_app.request(
+        after["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD"
+    )
+    return verify_same_world_restart(before, after, user, status, payload, result.get("cart_after"))
+
+
 def semantic_outcome(result):
     """Keep stable behavior fields while excluding run, project, actor and time IDs."""
     story = result.get("story")
@@ -809,6 +851,7 @@ class Campaign:
             "assessment": result["assessment"],
             "project_id": result.get("project_id"),
             "synthetic_shopper_id": result.get("synthetic_shopper_id"),
+            "cart_after": result.get("cart_after"),
             "checkout_attempt_count": result.get("checkout_attempt_count"),
             "semantic_outcome": semantic_outcome(result),
         }
@@ -931,6 +974,77 @@ def self_test():
             self.assertEqual(semantic_outcome(first), semantic_outcome(replay))
             replay["cart_after"] = [{"product_id": "demo-product", "quantity": 1}]
             self.assertNotEqual(semantic_outcome(first), semantic_outcome(replay))
+
+        def test_same_world_restart_rejects_project_drift_and_unavailable_or_wrong_readback(self):
+            user = "shop-11111111-1111-4111-8111-111111111111"
+            cart = [{"product_id": "demo-product", "quantity": 1}]
+            before = {
+                "project": "shop-0123456789ab",
+                "config": "/fixture/compose.json",
+                "docker_context": "default",
+                "users": {user: {"status": "OBSERVED"}},
+            }
+            after = json.loads(json.dumps(before))
+            payload = {"userId": user, "items": [{"productId": "demo-product", "quantity": 1}]}
+            result = verify_same_world_restart(before, after, user, 200, payload, cart)
+            self.assertTrue(result["project_unchanged"])
+            self.assertTrue(result["matches_pre_restart_observation"])
+            for changed_after, status, body in (
+                ({**after, "project": "shop-aaaaaaaaaaaa"}, 200, payload),
+                (after, 503, {}),
+                (after, 200, {"userId": "shop-22222222-2222-4222-8222-222222222222", "items": cart}),
+                (after, 200, {"userId": user, "items": []}),
+            ):
+                with self.subTest(project=changed_after["project"], status=status, body=body):
+                    with self.assertRaises((RuntimeError, ValueError)):
+                        verify_same_world_restart(before, changed_after, user, status, body, cart)
+
+        def test_campaign_action_supplies_bound_cart_to_same_world_restart(self):
+            user = "shop-11111111-1111-4111-8111-111111111111"
+            cart = [{"product_id": "demo-product", "quantity": 1}]
+            state = {
+                "project": "shop-0123456789ab",
+                "config": "/fixture/compose.json",
+                "docker_context": "default",
+                "http_port": 18080,
+                "users": {user: {"status": "OBSERVED"}},
+            }
+            self.campaign.state.mkdir(parents=True)
+            write_json(self.campaign.state / "state.json", state)
+            lifecycle_calls = []
+
+            def fake_cli(*args):
+                if args[0] == "story":
+                    run = self.campaign.evidence / "runs" / "restart-source"
+                    write_json(
+                        run / "run.json",
+                        {"command": "story", "status": "passed", "finished_at": timestamp(), "commands": []},
+                    )
+                    write_json(
+                        run / "result.json",
+                        {
+                            "story": "shared-cart-overlap",
+                            "assessment": {"passed": True, "expected": "overlap-observed"},
+                            "project_id": state["project"],
+                            "synthetic_shopper_id": user,
+                            "cart_after": cart,
+                            "concurrency_claim": "CLIENT_REQUEST_WINDOWS_OVERLAPPED_SERVER_HANDLER_OVERLAP_NOT_ESTABLISHED",
+                            "concurrent_client_results": [{"status": 200}, {"status": 200}],
+                            "final_cart_observation": "ONE_UPDATE_NOT_PRESENT",
+                        },
+                    )
+                else:
+                    lifecycle_calls.append(args[0])
+
+            self.campaign.cli = fake_cli
+            action = self.campaign.action(["story", "shared-cart-overlap"], "shared-cart-overlap")
+            self.assertEqual(action["synthetic_shopper_id"], user)
+            self.assertEqual(action["cart_after"], cart)
+            payload = {"userId": user, "items": [{"productId": "demo-product", "quantity": 1}]}
+            with mock.patch.object(shop_app, "request", return_value=(200, payload)):
+                result = observe_same_world_restart(self.campaign, action, state)
+            self.assertEqual(lifecycle_calls, ["stop", "start"])
+            self.assertTrue(result["matches_pre_restart_observation"])
 
         def test_semantic_mcp_repeatability_ignores_actor_ids_not_cart_mismatch(self):
             first = {
@@ -1437,6 +1551,10 @@ def main(argv=None):
             first = campaign.action(["story", story], story)
             summary["story_results"].append(first)
             previous = active_state(campaign.state)
+            if story == "shared-cart-overlap":
+                observation = observe_same_world_restart(campaign, first, previous)
+                summary["same_world_restart_observation"] = observation
+                previous = active_state(campaign.state)
             campaign.cli("reset")
             reset = active_state(campaign.state)
             assert_fresh(previous, reset, context, empty=True)
