@@ -29,6 +29,8 @@ class ShopControls(unittest.TestCase):
                 "cleanup_error_type": "AgentStopUnconfirmed",
                 "cleanup_failure_stage": "agent-stop",
                 "agent_stopped": False,
+                "runtime_guard_check": "vcr-record-mode",
+                "runtime_guard_error_type": "RuntimeError",
                 "prompt": secret,
                 "api_key": secret,
             },
@@ -38,8 +40,74 @@ class ShopControls(unittest.TestCase):
         self.assertIn('"error_type":"HTTPError"', message)
         self.assertIn('"cleanup_error_type":"AgentStopUnconfirmed"', message)
         self.assertIn('"agent_stopped":false', message)
+        self.assertIn('"runtime_guard_check":"vcr-record-mode"', message)
+        self.assertIn('"runtime_guard_error_type":"RuntimeError"', message)
         self.assertNotIn(secret, message)
         self.assertNotIn("api_key", message)
+
+    def test_agent_replay_failure_message_rejects_unrecognized_guard_diagnostics(self):
+        shop = self.module()
+        message = shop.agent_replay_failure_message(
+            {
+                "failure_stage": "runtime-guard",
+                "runtime_guard_check": "unsafe-check",
+                "runtime_guard_error_type": "RuntimeError\nsecret=private",
+            },
+            "fixture-endpoint",
+        )
+        self.assertIn('"failure_stage":"runtime-guard"', message)
+        self.assertNotIn("unsafe-check", message)
+        self.assertNotIn("private", message)
+
+    def test_agent_runtime_guard_failure_reports_only_allowlisted_check_and_type(self):
+        shop = self.module()
+        secret = "prompt and credential sentinel"
+        self.assertEqual(
+            shop.agent_runtime_guard_failure(
+                {
+                    "status": "UNKNOWN",
+                    "failed_check": "vcr-record-mode",
+                    "error_type": "RuntimeError",
+                    "detail": secret,
+                },
+                "a" * 64,
+            ),
+            {
+                "runtime_guard_check": "vcr-record-mode",
+                "runtime_guard_error_type": "RuntimeError",
+            },
+        )
+        self.assertEqual(
+            shop.agent_runtime_guard_failure(
+                {"status": "UNKNOWN", "failed_check": secret, "error_type": "RuntimeError"},
+                "a" * 64,
+            ),
+            {"runtime_guard_check": "guard-response", "runtime_guard_error_type": "RuntimeError"},
+        )
+        self.assertEqual(
+            shop.agent_runtime_guard_failure(
+                {
+                    "status": "PASS",
+                    "vcrpy": shop.AGENT_VCRPY_VERSION,
+                    "record_mode": "none",
+                    "overlay_sha256": "a" * 64,
+                },
+                "a" * 64,
+            ),
+            None,
+        )
+        self.assertEqual(
+            shop.agent_runtime_guard_failure(
+                {
+                    "status": "PASS",
+                    "vcrpy": shop.AGENT_VCRPY_VERSION,
+                    "record_mode": "new_episodes",
+                    "overlay_sha256": "a" * 64,
+                },
+                "a" * 64,
+            ),
+            {"runtime_guard_check": "vcr-record-mode"},
+        )
 
     def test_setup_makes_only_public_mounted_flags_guest_readable(self):
         shop = self.module()

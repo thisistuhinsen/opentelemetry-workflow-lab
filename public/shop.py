@@ -1841,6 +1841,18 @@ AGENT_REPLAY_STAGES = {
     "evidence-artifact",
 }
 
+AGENT_RUNTIME_GUARD_CHECKS = {
+    "imports",
+    "vcr-version",
+    "vcr-record-mode",
+    "replay-only-flag",
+    "llm-base-url",
+    "dummy-api-key",
+    "dummy-openai-key",
+    "overlay-digest",
+    "guard-response",
+}
+
 
 def agent_replay_failure_message(outcome, last_stage):
     """Produce a safe failure line from fixed fields only; never include payloads."""
@@ -1857,12 +1869,38 @@ def agent_replay_failure_message(outcome, last_stage):
     cleanup_stage = outcome.get("cleanup_failure_stage")
     if cleanup_stage == "agent-stop":
         diagnostic["cleanup_failure_stage"] = cleanup_stage
+    guard_check = outcome.get("runtime_guard_check")
+    if isinstance(guard_check, str) and guard_check in AGENT_RUNTIME_GUARD_CHECKS:
+        diagnostic["runtime_guard_check"] = guard_check
+    guard_error_type = outcome.get("runtime_guard_error_type")
+    if isinstance(guard_error_type, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", guard_error_type):
+        diagnostic["runtime_guard_error_type"] = guard_error_type
     if type(outcome.get("agent_stopped")) is bool:
         diagnostic["agent_stopped"] = outcome["agent_stopped"]
     return (
         "Agent cassette replay is UNKNOWN; no external model call or retry was allowed; diagnostic="
         + json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
     )
+
+
+def agent_runtime_guard_failure(guard, expected_overlay_sha256):
+    """Return only a fixed guard check and exception class; never echo guard output."""
+    if not isinstance(guard, dict):
+        return {"runtime_guard_check": "guard-response"}
+    if guard.get("status") != "PASS":
+        check = guard.get("failed_check")
+        error_type = guard.get("error_type")
+        failure = {"runtime_guard_check": check if check in AGENT_RUNTIME_GUARD_CHECKS else "guard-response"}
+        if isinstance(error_type, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", error_type):
+            failure["runtime_guard_error_type"] = error_type
+        return failure
+    if guard.get("vcrpy") != AGENT_VCRPY_VERSION:
+        return {"runtime_guard_check": "vcr-version"}
+    if guard.get("record_mode") != "none":
+        return {"runtime_guard_check": "vcr-record-mode"}
+    if guard.get("overlay_sha256") != expected_overlay_sha256:
+        return {"runtime_guard_check": "overlay-digest"}
+    return None
 
 
 def run_agent_replay(state, directory, runner=native, http=request):
@@ -1981,22 +2019,36 @@ def run_agent_replay(state, directory, runner=native, http=request):
         if internal.lower() != "true":
             raise RuntimeError("Agent replay network is not Docker-internal; no prompt was sent.")
         mark_stage("runtime-guard")
-        verify_script = (
-            "import hashlib,json,os,vcr; from src.agents.patch_vcr import VCR; "
-            "assert vcr.__version__ == '8.3.0'; "
-            "assert VCR.record_mode.value == 'none'; "
-            "assert os.environ.get('WORKFLOW_LAB_CASSETTE_REPLAY_ONLY') == '1'; "
-            "assert os.environ.get('LLM_BASE_URL') == 'http://127.0.0.1:9/v1'; "
-            "assert os.environ.get('API_KEY') == 'sk-dummy'; "
-            "assert os.environ.get('OPENAI_API_KEY') == 'sk-dummy'; "
-            "print(json.dumps({'vcrpy':vcr.__version__,'record_mode':VCR.record_mode.value,"
-            "'overlay_sha256':hashlib.sha256(open('/app/sitecustomize.py','rb').read()).hexdigest()}))"
-        )
+        verify_script = r"""import hashlib,json,os
+check='imports'
+try:
+ import vcr
+ from src.agents.patch_vcr import VCR
+ check='vcr-version'
+ if vcr.__version__ != '8.3.0': raise RuntimeError
+ check='vcr-record-mode'
+ if VCR.record_mode.value != 'none': raise RuntimeError
+ check='replay-only-flag'
+ if os.environ.get('WORKFLOW_LAB_CASSETTE_REPLAY_ONLY') != '1': raise RuntimeError
+ check='llm-base-url'
+ if os.environ.get('LLM_BASE_URL') != 'http://127.0.0.1:9/v1': raise RuntimeError
+ check='dummy-api-key'
+ if os.environ.get('API_KEY') != 'sk-dummy': raise RuntimeError
+ check='dummy-openai-key'
+ if os.environ.get('OPENAI_API_KEY') != 'sk-dummy': raise RuntimeError
+ check='overlay-digest'
+ digest=hashlib.sha256(open('/app/sitecustomize.py','rb').read()).hexdigest()
+ print(json.dumps({'status':'PASS','vcrpy':vcr.__version__,'record_mode':VCR.record_mode.value,'overlay_sha256':digest}))
+except Exception as error:
+ print(json.dumps({'status':'UNKNOWN','failed_check':check,'error_type':type(error).__name__}))"""
+        outcome["runtime_guard_check"] = "guard-response"
         guard = json.loads(
             runner(compose_args(state, ["exec", "-T", "agent", "python", "-c", verify_script]))
         )
-        if guard.get("overlay_sha256") != outcome["overlay_sha256"]:
-            raise RuntimeError("Agent replay guard did not load the captured overlay; no prompt was sent.")
+        guard_failure = agent_runtime_guard_failure(guard, outcome["overlay_sha256"])
+        if guard_failure:
+            outcome.update(guard_failure)
+            raise RuntimeError("Agent replay runtime guard is UNKNOWN; no prompt was sent.")
         mark_stage("fixture-endpoint")
         request_script = r"""import hashlib,json,urllib.request
 body=json.dumps({'message':'Show all available products in the store.','history':[]}).encode()
