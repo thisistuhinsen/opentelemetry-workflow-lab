@@ -1233,9 +1233,23 @@ class StoryOutcomeControls(unittest.TestCase):
                 )
                 self.assertEqual(missing["status"], "UNKNOWN")
         unavailable = shop.read_valkey_cart(
-            state, user, lambda _args: (_ for _ in ()).throw(OSError("offline"))
+            state, user, lambda _args: (_ for _ in ()).throw(OSError("private command detail"))
         )
         self.assertEqual(unavailable["status"], "UNKNOWN")
+        self.assertEqual(unavailable["reason"], "valkey-engine-binding-failed-or-invalid")
+        self.assertNotIn("private command detail", unavailable["reason"])
+        unavailable_container = shop.read_valkey_cart(
+            state,
+            user,
+            lambda args: (
+                "engine-test"
+                if "info" in args
+                else (_ for _ in ()).throw(RuntimeError("private container output"))
+            ),
+        )
+        self.assertEqual(unavailable_container["status"], "UNKNOWN")
+        self.assertEqual(unavailable_container["reason"], "valkey-container-read-failed-or-invalid")
+        self.assertNotIn("private container output", unavailable_container["reason"])
         contradicted = {**observed, "items": []}
         self.assertEqual(shop.compare_valkey_cart(user, observed["items"], contradicted), "CONTRADICTED")
         for drift in (

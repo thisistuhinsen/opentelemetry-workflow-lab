@@ -964,9 +964,11 @@ def decode_valkey_cart(data):
 
 def read_valkey_cart(state, user, runner=native):
     """Read one pinned cart hash through the captured Compose target; never write."""
+    phase = "input-validation"
     try:
         validate_user(user)
         config_path = Path(state.get("config", ""))
+        phase = "capture-binding"
         config_bytes = config_path.read_bytes()
         config_binding = {"sha256": hashlib.sha256(config_bytes).hexdigest(), "bytes": len(config_bytes)}
         recorded_bindings = state.get("input_bindings")
@@ -984,11 +986,13 @@ def read_valkey_cart(state, user, runner=native):
             or recorded_bindings.get("routing") != routing_binding(state)
         ):
             return {"status": "UNKNOWN", "reason": "unsupported-source-binding"}
+        phase = "engine-binding"
         engine = runner(
             ["docker", "--context", state["docker_context"], "info", "--format", "{{.ID}}"]
         ).strip()
         if engine != state["engine_id"]:
             return {"status": "UNKNOWN", "reason": "docker-engine-binding-changed"}
+        phase = "container-read"
         quoted_user = shlex.quote(user)
         script = (
             "set -e; "
@@ -999,12 +1003,14 @@ def read_valkey_cart(state, user, runner=native):
         rows = output.splitlines()
         if len(rows) != 2 or rows[0] != "1":
             return {"status": "UNKNOWN", "reason": "missing-or-malformed-valkey-readback"}
+        phase = "payload-decode"
         payload = base64.b64decode(rows[1], validate=True)
         cart = decode_valkey_cart(payload)
         if cart["user_id"] and cart["user_id"] != user:
             return {"status": "UNKNOWN", "reason": "valkey-payload-user-mismatch"}
         if cart["items"] and cart["user_id"] != user:
             return {"status": "UNKNOWN", "reason": "valkey-nonempty-cart-identity-unbound"}
+        phase = "post-read-binding"
         return {
             "status": "OBSERVED",
             "key_user_id": user,
@@ -1020,7 +1026,7 @@ def read_valkey_cart(state, user, runner=native):
             "config_sha256": hashlib.sha256(Path(state["config"]).read_bytes()).hexdigest(),
         }
     except (OSError, TypeError, ValueError, RuntimeError, subprocess.SubprocessError, binascii.Error):
-        return {"status": "UNKNOWN", "reason": "valkey-read-failed-or-invalid"}
+        return {"status": "UNKNOWN", "reason": "valkey-" + phase + "-failed-or-invalid"}
 
 
 def compare_valkey_cart(user, expected_items, observation):
