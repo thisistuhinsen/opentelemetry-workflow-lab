@@ -117,6 +117,34 @@ class FailureSummaryTests(unittest.TestCase):
             self.assertNotIn(secret, output)
             self.assertNotIn("api_key", output)
 
+    def test_agent_failure_uses_last_phase_if_result_record_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            campaign = ci_smoke.Campaign(root / "state", root / "evidence")
+            run_path = campaign.evidence / "runs" / "run-agent" / "run.json"
+            ci_smoke.write_json(
+                run_path,
+                {
+                    "command": "agent-replay",
+                    "status": "failed",
+                    "finished_at": "2026-11-04T00:00:01Z",
+                    "error": "Agent replay failed",
+                    "events": [
+                        {
+                            "type": "phase",
+                            "metadata": {"agent_replay_stage": "runtime-guard"},
+                        },
+                        {
+                            "type": "phase",
+                            "metadata": {"agent_replay_stage": {"untrusted": "ignored"}},
+                        },
+                    ],
+                },
+            )
+            detail = campaign._new_failed_run_summary(set(), "agent-replay")
+            self.assertIn('agent_replay={"last_observed_stage":"runtime-guard"}', detail)
+            self.assertNotIn("untrusted", detail)
+
     def test_failed_cli_falls_back_to_redacted_command_log_when_run_records_are_ambiguous(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -1834,6 +1834,15 @@ def run_agent_replay(state, directory, runner=native, http=request):
     """Exercise one pinned cassette with a dummy key, loopback endpoint and internal network."""
     if state.get("agent_replay_enabled") is not True:
         raise ValueError("Prepare this world with setup --agent-replay before requesting fixture replay.")
+    stage = "world-start"
+
+    def mark_stage(value):
+        nonlocal stage
+        stage = value
+        if _RECORDER is not None:
+            _RECORDER.phase("Agent replay stage observed", status="running", agent_replay_stage=value)
+
+    mark_stage(stage)
     verify_world(state, directory)
     overlay = Path(state["agent_replay_overlay"])
     cassette = Path(state["agent_replay_cassette"])
@@ -1863,13 +1872,12 @@ def run_agent_replay(state, directory, runner=native, http=request):
         "live_inference": False,
     }
     successful = False
-    stage = "world-start"
     agent_may_exist = False
     container_id = None
     try:
         if not state.get("started"):
             start_owned(state, directory, runner, http)
-        stage = "isolation-config"
+        mark_stage("isolation-config")
         config = json.loads(Path(state["config"]).read_bytes())
         expected_network = state["project"] + "_agent-replay"
         agent_service = config.get("services", {}).get("agent", {})
@@ -1889,7 +1897,7 @@ def run_agent_replay(state, directory, runner=native, http=request):
         ):
             raise ValueError("Replay-only isolation/configuration is absent; no agent prompt was sent.")
         agent_may_exist = True
-        stage = "agent-start"
+        mark_stage("agent-start")
         runner(
             compose_args(
                 state,
@@ -1899,7 +1907,7 @@ def run_agent_replay(state, directory, runner=native, http=request):
         container_id = runner(compose_args(state, ["ps", "--quiet", "agent"])).strip()
         if not re.fullmatch(r"[0-9a-f]{12,64}", container_id):
             raise RuntimeError("Agent container identity is unavailable; no prompt was sent.")
-        stage = "container-boundary"
+        mark_stage("container-boundary")
         inspect_prefix = ["docker", "--context", state["docker_context"], "inspect", container_id]
         mounts = json.loads(runner([*inspect_prefix, "--format", "{{json .Mounts}}"]))
         port_bindings = json.loads(runner([*inspect_prefix, "--format", "{{json .HostConfig.PortBindings}}"]))
@@ -1937,7 +1945,7 @@ def run_agent_replay(state, directory, runner=native, http=request):
         ).strip()
         if internal.lower() != "true":
             raise RuntimeError("Agent replay network is not Docker-internal; no prompt was sent.")
-        stage = "runtime-guard"
+        mark_stage("runtime-guard")
         verify_script = (
             "import hashlib,json,os,vcr; from src.agents.patch_vcr import VCR; "
             "assert vcr.__version__ == '8.3.0'; "
@@ -1954,7 +1962,7 @@ def run_agent_replay(state, directory, runner=native, http=request):
         )
         if guard.get("overlay_sha256") != outcome["overlay_sha256"]:
             raise RuntimeError("Agent replay guard did not load the captured overlay; no prompt was sent.")
-        stage = "fixture-endpoint"
+        mark_stage("fixture-endpoint")
         request_script = r"""import hashlib,json,urllib.request
 body=json.dumps({'message':'Show all available products in the store.','history':[]}).encode()
 request=urllib.request.Request('http://127.0.0.1:8010/prompt',data=body,headers={'Content-Type':'application/json'})
@@ -1994,7 +2002,15 @@ print(json.dumps({'http_status':status,'tool_names':sorted(set(tool_names)),'mes
         outcome["failure_stage"] = stage
     finally:
         if agent_may_exist:
-            stage = "agent-stop"
+            try:
+                mark_stage("agent-stop")
+            except Exception:
+                # A failure to write the phase marker must not skip stopping an
+                # agent container that may already exist.
+                outcome["status"] = "UNKNOWN"
+                outcome["cleanup_error_type"] = "ReplayStageEvidenceUnconfirmed"
+                outcome["cleanup_failure_stage"] = "agent-stop"
+                successful = False
             try:
                 runner(compose_args(state, ["stop", "--timeout", "10", "agent"]))
                 stopped = (

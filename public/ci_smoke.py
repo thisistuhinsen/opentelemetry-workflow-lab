@@ -975,6 +975,9 @@ def campaign_failure_diagnostic(summary, phase):
             "evidence-artifact",
         }:
             agent_detail["failure_stage"] = stage
+        last_stage = agent.get("last_observed_stage")
+        if isinstance(last_stage, str) and last_stage in AGENT_REPLAY_STAGES:
+            agent_detail["last_observed_stage"] = last_stage
         cleanup_stage = agent.get("cleanup_failure_stage")
         if cleanup_stage == "agent-stop":
             agent_detail["cleanup_failure_stage"] = cleanup_stage
@@ -987,6 +990,32 @@ def campaign_failure_diagnostic(summary, phase):
         if agent_detail:
             diagnostic["agent_replay_diagnostic"] = agent_detail
     return diagnostic
+
+
+AGENT_REPLAY_STAGES = {
+    "world-start",
+    "isolation-config",
+    "agent-start",
+    "container-boundary",
+    "runtime-guard",
+    "fixture-endpoint",
+    "agent-stop",
+    "evidence-artifact",
+}
+
+
+def agent_replay_last_observed_stage(run):
+    events = run.get("events") if isinstance(run, dict) else None
+    if not isinstance(events, list):
+        return None
+    for event in reversed(events):
+        if not isinstance(event, dict) or event.get("type") != "phase":
+            continue
+        metadata = event.get("metadata")
+        stage = metadata.get("agent_replay_stage") if isinstance(metadata, dict) else None
+        if isinstance(stage, str) and stage in AGENT_REPLAY_STAGES:
+            return stage
+    return None
 
 
 def agent_replay_failure_diagnostic(evidence, prior_runs):
@@ -1021,24 +1050,19 @@ def agent_replay_failure_diagnostic(evidence, prior_runs):
                 result = read_json(result_path)
         except (OSError, ValueError, RuntimeError):
             continue
-        if isinstance(run, dict) and run.get("command") == "agent-replay" and isinstance(result, dict):
-            matches.append(result)
+        if isinstance(run, dict) and run.get("command") == "agent-replay":
+            matches.append((run, result if isinstance(result, dict) else {}))
     if len(matches) != 1:
         return {"status": "UNKNOWN"}
-    result = matches[0]
+    run, result = matches[0]
     diagnostic = {"status": "UNKNOWN"}
     stage = result.get("failure_stage")
-    if isinstance(stage, str) and stage in {
-        "world-start",
-        "isolation-config",
-        "agent-start",
-        "container-boundary",
-        "runtime-guard",
-        "fixture-endpoint",
-        "agent-stop",
-        "evidence-artifact",
-    }:
+    if isinstance(stage, str) and stage in AGENT_REPLAY_STAGES:
         diagnostic["failure_stage"] = stage
+    else:
+        last_stage = agent_replay_last_observed_stage(run)
+        if last_stage:
+            diagnostic["last_observed_stage"] = last_stage
     cleanup_stage = result.get("cleanup_failure_stage")
     if cleanup_stage == "agent-stop":
         diagnostic["cleanup_failure_stage"] = cleanup_stage
@@ -1400,6 +1424,14 @@ class Campaign:
             agent_diagnostic = campaign_failure_diagnostic(
                 {"stories": [], "agent_replay": result}, "agent-fixture-replay"
             ).get("agent_replay_diagnostic")
+            if agent_diagnostic is None:
+                last_stage = agent_replay_last_observed_stage(run)
+                if last_stage:
+                    agent_diagnostic = {"last_observed_stage": last_stage}
+            elif "failure_stage" not in agent_diagnostic:
+                last_stage = agent_replay_last_observed_stage(run)
+                if last_stage:
+                    agent_diagnostic["last_observed_stage"] = last_stage
             if agent_diagnostic:
                 detail += " agent_replay=" + json.dumps(
                     agent_diagnostic, sort_keys=True, separators=(",", ":")
