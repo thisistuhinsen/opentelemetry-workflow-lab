@@ -964,7 +964,7 @@ def campaign_failure_diagnostic(summary, phase):
     if isinstance(agent, dict):
         agent_detail = {}
         stage = agent.get("failure_stage")
-        if stage in {
+        if isinstance(stage, str) and stage in {
             "world-start",
             "isolation-config",
             "agent-start",
@@ -1014,8 +1014,11 @@ def agent_replay_failure_diagnostic(evidence, prior_runs):
                 or not result_path.is_file()
                 or result_path.stat().st_size > 65536
             ):
-                continue
-            result = read_json(result_path)
+                if result_path.exists() or result_path.is_symlink():
+                    continue
+                result = run.get("result") if isinstance(run, dict) else None
+            else:
+                result = read_json(result_path)
         except (OSError, ValueError, RuntimeError):
             continue
         if isinstance(run, dict) and run.get("command") == "agent-replay" and isinstance(result, dict):
@@ -1025,7 +1028,7 @@ def agent_replay_failure_diagnostic(evidence, prior_runs):
     result = matches[0]
     diagnostic = {"status": "UNKNOWN"}
     stage = result.get("failure_stage")
-    if stage in {
+    if isinstance(stage, str) and stage in {
         "world-start",
         "isolation-config",
         "agent-start",
@@ -1392,6 +1395,15 @@ class Campaign:
             stderr_detail = self._failed_native_stderr(path.parent, run.get("commands"))
             if stderr_detail:
                 detail = stderr_detail
+        if command == "agent-replay":
+            result = run.get("result")
+            agent_diagnostic = campaign_failure_diagnostic(
+                {"stories": [], "agent_replay": result}, "agent-fixture-replay"
+            ).get("agent_replay_diagnostic")
+            if agent_diagnostic:
+                detail += " agent_replay=" + json.dumps(
+                    agent_diagnostic, sort_keys=True, separators=(",", ":")
+                )
         return f"phase={command} status=failed error={detail}"
 
     def _failed_native_stderr(self, run_directory, commands):

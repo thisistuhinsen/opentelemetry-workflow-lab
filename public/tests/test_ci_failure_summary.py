@@ -67,6 +67,56 @@ class FailureSummaryTests(unittest.TestCase):
             self.assertNotIn("abc.def.ghi", output)
             self.assertNotIn("raw output", output)
 
+    def test_failed_agent_cli_includes_only_allowlisted_phase_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            campaign = ci_smoke.Campaign(root / "state", root / "evidence")
+            stderr = io.StringIO()
+            secret = "private fixture response and api key"
+
+            def failed_cli(argv, *, stdout, **kwargs):
+                ci_smoke.write_json(
+                    campaign.evidence / "runs" / "run-agent" / "run.json",
+                    {
+                        "command": "agent-replay",
+                        "status": "failed",
+                        "finished_at": "2026-11-04T00:00:01Z",
+                        "error": "A required command failed (exit 1).",
+                        "commands": [{"status": "failed", "stderr_name": "001.stderr.log"}],
+                        "result": {
+                            "failure_stage": "fixture-endpoint",
+                            "error_type": "HTTPError",
+                            "prompt": secret,
+                            "api_key": secret,
+                        },
+                    },
+                )
+                log_dir = campaign.evidence / "runs" / "run-agent" / "commands"
+                log_dir.mkdir()
+                (log_dir / "001.stderr.log").write_text(
+                    "RuntimeError: cassette fixture endpoint failed\n", encoding="utf-8"
+                )
+                return SimpleNamespace(returncode=1)
+
+            with mock.patch.object(ci_smoke.subprocess, "run", side_effect=failed_cli):
+                with (
+                    contextlib.redirect_stderr(stderr),
+                    self.assertRaisesRegex(RuntimeError, "Shop step failed"),
+                ):
+                    campaign.cli("agent-replay")
+
+            output = stderr.getvalue()
+            self.assertIn(
+                "cassette fixture endpoint failed agent_replay=",
+                output,
+            )
+            self.assertIn(
+                'agent_replay={"error_type":"HTTPError","failure_stage":"fixture-endpoint"}',
+                output,
+            )
+            self.assertNotIn(secret, output)
+            self.assertNotIn("api_key", output)
+
     def test_failed_cli_falls_back_to_redacted_command_log_when_run_records_are_ambiguous(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
