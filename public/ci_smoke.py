@@ -31,6 +31,9 @@ def safe_failure_detail(value, limit=240):
     if not isinstance(value, str) or not value.strip():
         return "detail unavailable; inspect the retained evidence artifact"
     detail = " ".join(value.split())
+    detail = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", detail)
+    detail = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", detail)
+    detail = re.sub(r"(?i)\b(https?://)[^/@\s:]+:[^/@\s]+@", r"\1[credentials]@", detail)
     detail = re.sub(r"(?i)\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b", "[email]", detail)
     detail = re.sub(
         r"\bshop-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
@@ -42,6 +45,11 @@ def safe_failure_detail(value, limit=240):
     detail = re.sub(
         r"(?i)\b(authorization|password|token|secret)\s*[:=]\s*(?:(?:bearer|basic)\s+)?\S+",
         r"\1=[redacted]",
+        detail,
+    )
+    detail = re.sub(
+        r"(?i)\b(?:gh[pousr]_|github_pat_|sk-|AIza|ya29\.)[A-Za-z0-9_.-]{16,}\b",
+        "[credential]",
         detail,
     )
     detail = re.sub(r"\s+", " ", detail).strip()
@@ -622,8 +630,11 @@ class Campaign:
             record["exit_code"] = result.returncode
             if result.returncode:
                 failed = self._new_failed_run_summary(prior_runs)
-                if failed:
-                    print("Shop CI detail: " + failed, file=sys.stderr, flush=True)
+                if not failed:
+                    failed = self._command_log_failure_summary(
+                        self.receipts / record["log"], arguments, result.returncode
+                    )
+                print("Shop CI detail: " + failed, file=sys.stderr, flush=True)
                 raise RuntimeError("Shop step failed: " + " ".join(arguments) + "; inspect " + record["log"])
         finally:
             record.update(completed_utc=timestamp(), duration_seconds=time.monotonic() - start)
@@ -663,6 +674,57 @@ class Campaign:
             return ""
         detail = safe_failure_detail(run.get("error"))
         return f"phase={command} status=failed error={detail}"
+
+    def _command_log_failure_summary(self, path, arguments, exit_code):
+        """Summarize only the failed command's terminal exception line, never raw logs."""
+        command = (
+            arguments[0]
+            if arguments
+            and arguments[0]
+            in {
+                "setup",
+                "start",
+                "story",
+                "reset",
+                "replay",
+                "stop",
+                "clean",
+            }
+            else "unknown"
+        )
+        summary = f"phase={command} status=failed exit={exit_code}"
+        try:
+            if path.is_symlink() or not path.resolve().is_relative_to(self.receipts) or not path.is_file():
+                return summary + " error=command log unavailable"
+            with path.open("rb") as stream:
+                size = path.stat().st_size
+                stream.seek(max(0, size - 65536))
+                tail = stream.read(65536).decode("utf-8", errors="replace")
+        except (OSError, RuntimeError):
+            return summary + " error=command log unavailable"
+
+        lines = tail.splitlines()
+        traceback_start = max(
+            (
+                index
+                for index, line in enumerate(lines)
+                if line.strip() == "Traceback (most recent call last):"
+            ),
+            default=-1,
+        )
+        if traceback_start < 0:
+            return summary + " error=terminal exception detail unavailable"
+        exception = None
+        for line in reversed(lines[traceback_start + 1 :]):
+            match = re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))(?::\s*(.*))?\s*", line)
+            if match:
+                exception = match
+                break
+        if exception is None:
+            return summary + " error=terminal exception detail unavailable"
+        name = exception.group(1)
+        detail = safe_failure_detail(exception.group(2) or "detail unavailable")
+        return f"{summary} exception={name} error={detail}"
 
     def action(self, command, story):
         runs = self.evidence / "runs"
