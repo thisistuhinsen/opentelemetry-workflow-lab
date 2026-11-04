@@ -144,6 +144,13 @@ def assess_story(story, outcome):
             and client_results[1].get("cart_after") == []
             and outcome.get("cart_HTTP_status") == 200
             and after == []
+            and outcome.get("cart_identity_observations")
+            == {
+                "empty_prestate": "NOT_ECHOED_FOR_EMPTY_CART",
+                "actor_a_nonempty_readback": "MATCHED_REQUESTED_SHOPPER",
+                "actor_b_empty_readback": "NOT_ECHOED_FOR_EMPTY_CART",
+                "host_empty_readback": "NOT_ECHOED_FOR_EMPTY_CART",
+            }
             and outcome.get("actor_identity") == "HARNESS_LABELS_ONLY_NOT_APPLICATION_AUTHENTICATION"
             and outcome.get("concurrency_claim") == "SEQUENTIALLY_ORDERED_NOT_OVERLAP_TESTED"
         )
@@ -680,16 +687,20 @@ def reset_subject(state, user, http=request):
     if status not in (200, 204):
         raise RuntimeError("Exact shopper cart reset failed; no retry was made.")
     read_status, cart = http(state["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD")
-    if (
-        read_status != 200
-        or not isinstance(cart, dict)
-        or cart.get("userId") != user
-        or cart.get("items") != []
-    ):
+    if read_status != 200:
+        raise RuntimeError("Reset acknowledgement did not produce an API empty-cart readback; no retry.")
+    try:
+        empty = cart_items(cart, expected_user=user) == []
+    except ValueError as error:
+        raise RuntimeError(
+            "Reset acknowledgement did not produce an API empty-cart readback; no retry."
+        ) from error
+    if not empty:
         raise RuntimeError("Reset acknowledgement did not produce an API empty-cart readback; no retry.")
     return {
         "synthetic_cart_reset_status": status,
         "API_cart_readback_empty": True,
+        "API_cart_readback_identity": cart_identity_status(cart, user),
         "other_data_touched": False,
     }
 
@@ -707,12 +718,22 @@ def claim_checkout(directory, user):
     return path
 
 
+def cart_identity_status(value, expected_user):
+    if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+        raise ValueError("Cart read has no valid items array; empty-cart observation is unknown.")
+    if value.get("userId") == expected_user:
+        return "MATCHED_REQUESTED_SHOPPER"
+    if value.get("items") == [] and value.get("userId") in (None, ""):
+        return "NOT_ECHOED_FOR_EMPTY_CART"
+    raise ValueError("Cart read is for another or unknown synthetic shopper; observation is unknown.")
+
+
 def cart_items(value, *, expected_user=None):
     result = []
     if not isinstance(value, dict) or not isinstance(value.get("items"), list):
         raise ValueError("Cart read has no valid items array; empty-cart observation is unknown.")
-    if expected_user is not None and value.get("userId") != expected_user:
-        raise ValueError("Cart read is for another or unknown synthetic shopper; observation is unknown.")
+    if expected_user is not None:
+        cart_identity_status(value, expected_user)
     for item in value["items"]:
         if not isinstance(item, dict):
             raise ValueError("Cart item schema is invalid; cart observation is unknown.")
@@ -787,6 +808,7 @@ def run_shared_cart_conflict(state, directory, user, product, runner, http):
     )
     if initial_status != 200 or cart_items(initial, expected_user=user):
         raise ValueError("Shared-cart conflict requires a verified empty prestate; no actor ran.")
+    initial_identity = cart_identity_status(initial, user)
     second_product = product[1]
     if product[0] == second_product:
         raise ValueError("The catalogue did not provide distinct products for the conflict case.")
@@ -820,6 +842,7 @@ main().catch(error => { console.error(String(error)); process.exitCode = 1; });
         raise RuntimeError("First shared-cart client result is missing or unbound; state is unknown.")
     actor_a_cart = json.loads(actor_a["raw_response"])
     added_items = cart_items(actor_a_cart, expected_user=user)
+    actor_a_identity = cart_identity_status(actor_a_cart, user)
     expected_item = {"product_id": product[0], "quantity": 1}
     if added_items != [expected_item]:
         raise RuntimeError("First client did not observe its expected cart write; state is unknown.")
@@ -854,10 +877,12 @@ main().catch(error => { console.error(String(error)); process.exitCode = 1; });
         raise RuntimeError("Second shared-cart client did not clear and read the cart; state is unknown.")
     actor_b_cart = json.loads(actor_b["read"]["raw_response"])
     client_b_items = cart_items(actor_b_cart, expected_user=user)
+    actor_b_identity = cart_identity_status(actor_b_cart, user)
     observer_status, observer = http(
         state["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD"
     )
     observed_items = cart_items(observer, expected_user=user) if observer_status == 200 else None
+    observer_identity = cart_identity_status(observer, user) if observer_status == 200 else "UNKNOWN"
     return {
         "story": "shared-cart-conflict",
         "cart_before": [],
@@ -886,6 +911,12 @@ main().catch(error => { console.error(String(error)); process.exitCode = 1; });
             },
         ],
         "host_cart_after": observed_items,
+        "cart_identity_observations": {
+            "empty_prestate": initial_identity,
+            "actor_a_nonempty_readback": actor_a_identity,
+            "actor_b_empty_readback": actor_b_identity,
+            "host_empty_readback": observer_identity,
+        },
         "actor_identity": "HARNESS_LABELS_ONLY_NOT_APPLICATION_AUTHENTICATION",
         "concurrency_claim": "SEQUENTIALLY_ORDERED_NOT_OVERLAP_TESTED",
         "runtime_qualification": "OBSERVATION_ONLY_NO_PRODUCT_AUTH_OR_CONCURRENCY_CLAIM",
@@ -1039,6 +1070,10 @@ asyncio.run(main())
                 "MCP_cart": normalized_mcp.get(user, []),
                 "HTTP_carts_by_synthetic_actor": http_carts,
                 "MCP_carts_by_synthetic_actor": normalized_mcp,
+                "HTTP_cart_identity_by_actor": {
+                    user: cart_identity_status(primary, user),
+                    other_user: cart_identity_status(other, other_user),
+                },
                 "actor_isolation_verified": actor_isolation_verified,
                 "projections_match": projections_match,
                 "runtime_qualification": "OBSERVATION_ONLY_NOT_INDEPENDENT_EFFECT_PROOF",
@@ -1074,6 +1109,8 @@ asyncio.run(main())
             "cart_HTTP_status": after_status,
             "cart_before": cart_items(before, expected_user=user),
             "cart_after": cart_items(after, expected_user=user),
+            "cart_before_identity_status": cart_identity_status(before, user),
+            "cart_after_identity_status": cart_identity_status(after, user),
             "runtime_qualification": "OBSERVATION_ONLY_NO_SETTLEMENT_OR_RETRY_SAFETY_CLAIM",
         }
     outcome["assessment"] = assess_story(story, outcome)

@@ -538,6 +538,8 @@ def semantic_outcome(result):
             "cart_relation": relation,
             "cart_before": before,
             "cart_after": after,
+            "cart_before_identity_status": result.get("cart_before_identity_status"),
+            "cart_after_identity_status": result.get("cart_after_identity_status"),
         }
     if story == "mcp-session-id":
         return {
@@ -550,6 +552,7 @@ def semantic_outcome(result):
                 json.dumps(cart, sort_keys=True)
                 for cart in result.get("MCP_carts_by_synthetic_actor", {}).values()
             ),
+            "http_cart_identity_statuses": sorted(result.get("HTTP_cart_identity_by_actor", {}).values()),
             "actor_isolation_verified": result.get("actor_isolation_verified"),
             "projections_match": result.get("projections_match"),
             "tool_error": result.get("tool_error"),
@@ -563,6 +566,7 @@ def semantic_outcome(result):
             "delete_status": actors[1].get("delete_status") if len(actors) == 2 else None,
             "final_cart_contents": result.get("cart_after"),
             "host_cart_contents": result.get("host_cart_after"),
+            "cart_identity_observations": result.get("cart_identity_observations"),
         }
     raise ValueError("No stable semantic comparison is defined for this story.")
 
@@ -801,6 +805,8 @@ def self_test():
                 "cart_HTTP_status": 200,
                 "cart_before": [{"product_id": "demo-product", "quantity": 1}],
                 "cart_after": [],
+                "cart_before_identity_status": "MATCHED_REQUESTED_SHOPPER",
+                "cart_after_identity_status": "NOT_ECHOED_FOR_EMPTY_CART",
                 "assessment": {"passed": True, "expected": "success-empty"},
             }
             replay = {
@@ -827,6 +833,10 @@ def self_test():
                 "actor_isolation_verified": True,
                 "projections_match": True,
                 "tool_error": False,
+                "HTTP_cart_identity_by_actor": {
+                    "actor-one": "MATCHED_REQUESTED_SHOPPER",
+                    "actor-two": "MATCHED_REQUESTED_SHOPPER",
+                },
                 "assessment": {"passed": True, "expected": "matching-cart"},
             }
             replay = json.loads(json.dumps(first))
@@ -840,6 +850,24 @@ def self_test():
             }
             self.assertEqual(semantic_outcome(first), semantic_outcome(replay))
             replay["MCP_carts_by_synthetic_actor"]["fresh-two"] = []
+            self.assertNotEqual(semantic_outcome(first), semantic_outcome(replay))
+
+        def test_identity_evidence_changes_stable_comparison(self):
+            first = {
+                "story": "normal-checkout",
+                "checkout_attempt_count": 1,
+                "checkout_HTTP_status": 200,
+                "order_response_present": True,
+                "cart_HTTP_status": 200,
+                "cart_before": [{"product_id": "demo-product", "quantity": 1}],
+                "cart_after": [],
+                "cart_before_identity_status": "MATCHED_REQUESTED_SHOPPER",
+                "cart_after_identity_status": "NOT_ECHOED_FOR_EMPTY_CART",
+                "assessment": {"passed": True, "expected": "success-empty"},
+            }
+            replay = dict(first)
+            self.assertEqual(semantic_outcome(first), semantic_outcome(replay))
+            replay["cart_after_identity_status"] = "MATCHED_REQUESTED_SHOPPER"
             self.assertNotEqual(semantic_outcome(first), semantic_outcome(replay))
 
         def test_companion_coexists_with_one_matching_primary(self):

@@ -225,10 +225,11 @@ class ShopControls(unittest.TestCase):
 
         def http(port, method, path, body=None):
             calls.append((method, path, body))
-            return (204, None) if method == "DELETE" else (200, {"userId": user, "items": []})
+            return (204, None) if method == "DELETE" else (200, {"items": []})
 
         result = shop.reset_subject({"users": {user: {"status": "OBSERVED"}}, "http_port": 18080}, user, http)
         self.assertTrue(result["API_cart_readback_empty"])
+        self.assertEqual(result["API_cart_readback_identity"], "NOT_ECHOED_FOR_EMPTY_CART")
         self.assertEqual(calls[0], ("DELETE", "/api/cart", {"userId": user}))
         self.assertEqual(calls[1][0], "GET")
 
@@ -288,6 +289,21 @@ class ShopControls(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     shop.cart_items(malformed_cart)
             self.assertEqual(shop.cart_items({"items": []}), [])
+
+    def test_empty_cart_identity_is_explicitly_not_echoed_but_wrong_owner_rejects(self):
+        shop = self.module()
+        user = "shop-11111111-1111-4111-8111-111111111111"
+        self.assertEqual(shop.cart_identity_status({"items": []}, user), "NOT_ECHOED_FOR_EMPTY_CART")
+        self.assertEqual(
+            shop.cart_identity_status({"userId": user, "items": []}, user),
+            "MATCHED_REQUESTED_SHOPPER",
+        )
+        with self.assertRaisesRegex(ValueError, "another or unknown"):
+            shop.cart_identity_status(
+                {"userId": "shop-22222222-2222-4222-8222-222222222222", "items": []}, user
+            )
+        with self.assertRaisesRegex(ValueError, "another or unknown"):
+            shop.cart_identity_status({"userId": "", "items": [{"productId": "x", "quantity": 1}]}, user)
 
     def test_local_fixed_mcp_requires_all_public_derivation_pins(self):
         shop = self.module()
@@ -570,7 +586,8 @@ class ShopControls(unittest.TestCase):
                 return 204, None
             if method == "GET" and path.startswith("/api/cart"):
                 user = path.split("sessionId=")[1].split("&")[0]
-                return 200, {"userId": user, "items": carts.get(user, [])}
+                items = carts.get(user, [])
+                return 200, {"userId": user, "items": items} if items else {"items": []}
             raise AssertionError((method, path))
 
         return runner, http, native_calls, http_calls
@@ -591,6 +608,8 @@ class ShopControls(unittest.TestCase):
             self.assertEqual(result["checkout_attempt_count"], 1)
             self.assertEqual(result["project_id"], state["project"])
             self.assertEqual(result["synthetic_shopper_id"], state["last_user"])
+            self.assertEqual(result["cart_before_identity_status"], "MATCHED_REQUESTED_SHOPPER")
+            self.assertEqual(result["cart_after_identity_status"], "NOT_ECHOED_FOR_EMPTY_CART")
             self.assertEqual(
                 len([x for x in requests if x[0] == "POST" and x[1].startswith("/api/checkout")]), 1
             )
@@ -632,7 +651,8 @@ class ShopControls(unittest.TestCase):
                     return 200, [{"id": "demo-product"}, {"id": "other-product"}]
                 if method == "GET" and path.startswith("/api/cart"):
                     user = path.split("sessionId=")[1].split("&")[0]
-                    return 200, {"userId": user, "items": carts.get(user, [])}
+                    items = carts.get(user, [])
+                    return 200, {"userId": user, "items": items} if items else {"items": []}
                 raise AssertionError((method, path))
 
             def runner(args, source=None):
@@ -657,7 +677,7 @@ class ShopControls(unittest.TestCase):
                     )
                 carts[user] = []
                 delete_raw = ""
-                read_raw = json.dumps({"userId": user, "items": carts[user]})
+                read_raw = json.dumps({"items": []})
                 return json.dumps(
                     {
                         "actor_label": actor,
@@ -690,6 +710,15 @@ class ShopControls(unittest.TestCase):
             self.assertEqual(outcome["actor_intents"][1]["sequence"], 2)
             self.assertEqual(outcome["ordered_client_results"][1]["cart_after"], [])
             self.assertEqual(outcome["host_cart_after"], [])
+            self.assertEqual(
+                outcome["cart_identity_observations"],
+                {
+                    "empty_prestate": "NOT_ECHOED_FOR_EMPTY_CART",
+                    "actor_a_nonempty_readback": "MATCHED_REQUESTED_SHOPPER",
+                    "actor_b_empty_readback": "NOT_ECHOED_FOR_EMPTY_CART",
+                    "host_empty_readback": "NOT_ECHOED_FOR_EMPTY_CART",
+                },
+            )
             self.assertEqual(
                 hashlib.sha256(outcome["ordered_client_results"][0]["raw_response"].encode()).hexdigest(),
                 outcome["ordered_client_results"][0]["raw_response_sha256"],
@@ -945,6 +974,8 @@ class StoryOutcomeControls(unittest.TestCase):
             "order_response_present": True,
             "cart_before": item,
             "cart_after": item,
+            "cart_before_identity_status": "MATCHED_REQUESTED_SHOPPER",
+            "cart_after_identity_status": "MATCHED_REQUESTED_SHOPPER",
         }
         self.assertFalse(shop.assess_story("normal-checkout", outcome)["passed"])
         self.assertTrue(shop.assess_story("cart-failure", outcome)["passed"])
@@ -964,6 +995,8 @@ class StoryOutcomeControls(unittest.TestCase):
                     "order_response_present": True,
                     "cart_before": item,
                     "cart_after": [],
+                    "cart_before_identity_status": "MATCHED_REQUESTED_SHOPPER",
+                    "cart_after_identity_status": "NOT_ECHOED_FOR_EMPTY_CART",
                 },
             )["passed"]
         )
@@ -977,6 +1010,8 @@ class StoryOutcomeControls(unittest.TestCase):
                     "order_response_present": False,
                     "cart_before": item,
                     "cart_after": item,
+                    "cart_before_identity_status": "MATCHED_REQUESTED_SHOPPER",
+                    "cart_after_identity_status": "MATCHED_REQUESTED_SHOPPER",
                 },
             )["passed"]
         )
