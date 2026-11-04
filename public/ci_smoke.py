@@ -629,7 +629,7 @@ class Campaign:
                 )
             record["exit_code"] = result.returncode
             if result.returncode:
-                failed = self._new_failed_run_summary(prior_runs)
+                failed = self._new_failed_run_summary(prior_runs, arguments[0] if arguments else None)
                 if not failed:
                     failed = self._command_log_failure_summary(
                         self.receipts / record["log"], arguments, result.returncode
@@ -640,40 +640,73 @@ class Campaign:
             record.update(completed_utc=timestamp(), duration_seconds=time.monotonic() - start)
             write_json(self.receipts / (stem + ".json"), record)
 
-    def _new_failed_run_summary(self, prior_runs):
+    def _new_failed_run_summary(self, prior_runs, expected_command=None):
         runs = self.evidence / "runs"
         if not runs.is_dir():
             return ""
         fresh = sorted(set(runs.glob("*/run.json")) - prior_runs)
-        if len(fresh) != 1:
+        primary = []
+        for path in fresh:
+            try:
+                if (
+                    path.is_symlink()
+                    or not path.resolve().is_relative_to(self.evidence)
+                    or not path.is_file()
+                    or path.stat().st_size > 65536
+                ):
+                    continue
+                run = read_json(path)
+            except (OSError, ValueError, RuntimeError):
+                continue
+            command = run.get("command") if isinstance(run, dict) else None
+            if (
+                isinstance(command, str)
+                and command in {"setup", "start", "story", "reset", "replay", "stop", "clean"}
+                and (expected_command is None or command == expected_command)
+                and run.get("status") == "failed"
+                and isinstance(run.get("finished_at"), str)
+            ):
+                primary.append((path, run))
+        if len(primary) != 1:
             return ""
-        path = fresh[0]
-        if (
-            path.is_symlink()
-            or not path.resolve().is_relative_to(self.evidence)
-            or not path.is_file()
-            or path.stat().st_size > 65536
-        ):
-            return ""
-        try:
-            run = read_json(path)
-        except (OSError, ValueError):
-            return ""
-        if not isinstance(run, dict) or run.get("status") != "failed":
-            return ""
-        command = run.get("command")
-        if not isinstance(command, str) or command not in {
-            "setup",
-            "start",
-            "story",
-            "reset",
-            "replay",
-            "stop",
-            "clean",
-        }:
-            return ""
+        path, run = primary[0]
+        command = run["command"]
         detail = safe_failure_detail(run.get("error"))
+        if isinstance(run.get("error"), str) and re.match(
+            r"^A required command failed \(exit -?\d+\)\.", run["error"]
+        ):
+            stderr_detail = self._failed_native_stderr(path.parent, run.get("commands"))
+            if stderr_detail:
+                detail = stderr_detail
         return f"phase={command} status=failed error={detail}"
+
+    def _failed_native_stderr(self, run_directory, commands):
+        if not isinstance(commands, list):
+            return ""
+        failed = [row for row in commands if isinstance(row, dict) and row.get("status") == "failed"]
+        if len(failed) != 1:
+            return ""
+        name = failed[0].get("stderr_name")
+        if not isinstance(name, str) or not re.fullmatch(r"[0-9]{3}\.stderr\.log", name):
+            return ""
+        directory = run_directory / "commands"
+        path = directory / name
+        try:
+            if (
+                directory.is_symlink()
+                or path.is_symlink()
+                or not path.resolve().is_relative_to(directory.resolve())
+                or not path.is_file()
+            ):
+                return ""
+            with path.open("rb") as stream:
+                size = path.stat().st_size
+                stream.seek(max(0, size - 65536))
+                tail = stream.read(65536).decode("utf-8", errors="replace")
+        except (OSError, RuntimeError):
+            return ""
+        lines = [line.strip() for line in tail.splitlines() if line.strip()]
+        return safe_failure_detail(lines[-1]) if lines else ""
 
     def _command_log_failure_summary(self, path, arguments, exit_code):
         """Summarize only the failed command's terminal exception line, never raw logs."""

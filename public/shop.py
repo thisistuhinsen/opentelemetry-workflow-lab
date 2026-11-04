@@ -45,6 +45,7 @@ CORE_SERVICES = (
     "shipping",
     "valkey-cart",
 )
+FRONTEND_NODE = "/nodejs/bin/node"  # The pinned distroless image uses this entrypoint path.
 STORIES = json.loads((PUBLIC / "stories.json").read_bytes())["stories"]
 PROFILE = json.loads((PUBLIC / "runtime-profile.json").read_bytes())
 for _name, _story in STORIES.items():
@@ -830,7 +831,7 @@ main().catch(error => { console.error(String(error)); process.exitCode = 1; });
     state["users"][user] = {"status": "DISPATCHED", "story": "shared-cart-conflict"}
     write_json(directory / "state.json", state)
     actor_a = json.loads(
-        runner(compose_args(state, ["exec", "-T", "frontend", "node", "-e", actor_a_source]))
+        runner(compose_args(state, ["exec", "-T", "frontend", FRONTEND_NODE, "-e", actor_a_source]))
     )
     if (
         actor_a.get("status") != 200
@@ -864,7 +865,7 @@ async function main() {
 main().catch(error => { console.error(String(error)); process.exitCode = 1; });
 """.replace("USER_ID", json.dumps(user))
     actor_b = json.loads(
-        runner(compose_args(state, ["exec", "-T", "frontend", "node", "-e", actor_b_source]))
+        runner(compose_args(state, ["exec", "-T", "frontend", FRONTEND_NODE, "-e", actor_b_source]))
     )
     if actor_b.get("actor_label") != "actor-B" or actor_b.get("intent") != "clear-shared-cart":
         raise RuntimeError("Second shared-cart client identity is missing; state is unknown.")

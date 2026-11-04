@@ -45,6 +45,7 @@ class FailureSummaryTests(unittest.TestCase):
                     {
                         "command": "story",
                         "status": "failed",
+                        "finished_at": "2026-11-04T00:00:01Z",
                         "error": "Cart read for shopper@example.test returned 4111111111111111; "
                         "Authorization: Bearer abc.def.ghi",
                     },
@@ -84,7 +85,12 @@ class FailureSummaryTests(unittest.TestCase):
                 for run_id in ("run-a", "run-b"):
                     ci_smoke.write_json(
                         campaign.evidence / "runs" / run_id / "run.json",
-                        {"command": "story", "status": "failed", "error": "ambiguous"},
+                        {
+                            "command": "story",
+                            "status": "failed",
+                            "finished_at": "2026-11-04T00:00:01Z",
+                            "error": "ambiguous",
+                        },
                     )
                 return SimpleNamespace(returncode=1)
 
@@ -166,6 +172,52 @@ class FailureSummaryTests(unittest.TestCase):
             self.assertNotIn("secret-value", output)
             self.assertNotIn("raw response body", output)
 
+    def test_failed_native_stderr_is_joined_to_the_primary_run_not_live_companion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            campaign = ci_smoke.Campaign(root / "state", root / "evidence")
+            stderr = io.StringIO()
+
+            def failed_cli(argv, *, stdout, **kwargs):
+                primary = campaign.evidence / "runs" / "primary"
+                commands = primary / "commands"
+                commands.mkdir(parents=True)
+                (commands / "001.stderr.log").write_text(
+                    'exec: "node": executable file not found in $PATH for shopper@example.test\n',
+                    encoding="utf-8",
+                )
+                ci_smoke.write_json(
+                    primary / "run.json",
+                    {
+                        "command": "story",
+                        "status": "failed",
+                        "finished_at": "2026-11-04T00:00:01Z",
+                        "error": "A required command failed (exit 127). Open stderr in the run viewer.",
+                        "commands": [{"status": "failed", "stderr_name": "001.stderr.log"}],
+                    },
+                )
+                ci_smoke.write_json(
+                    campaign.evidence / "runs" / "companion" / "run.json",
+                    {"command": "Live service logs", "status": "running"},
+                )
+                return SimpleNamespace(returncode=1)
+
+            with mock.patch.object(ci_smoke.subprocess, "run", side_effect=failed_cli):
+                with (
+                    contextlib.redirect_stderr(stderr),
+                    self.assertRaisesRegex(RuntimeError, "Shop step failed"),
+                ):
+                    campaign.cli("story", "shared-cart-conflict")
+
+            output = stderr.getvalue()
+            self.assertIn(
+                'Shop CI detail: phase=story status=failed error=exec: "node": '
+                "executable file not found in $PATH for [email]",
+                output,
+            )
+            self.assertNotIn("shopper@example.test", output)
+            self.assertNotIn("Open stderr in the run viewer", output)
+
     def test_missing_run_directory_produces_no_detail(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -197,7 +249,12 @@ class FailureSummaryTests(unittest.TestCase):
             for name in ("run-1", "run-2"):
                 ci_smoke.write_json(
                     campaign.evidence / "runs" / name / "run.json",
-                    {"command": "story", "status": "failed", "error": "cart read failed"},
+                    {
+                        "command": "story",
+                        "status": "failed",
+                        "finished_at": "2026-11-04T00:00:01Z",
+                        "error": "cart read failed",
+                    },
                 )
             self.assertEqual(campaign._new_failed_run_summary(set()), "")
 

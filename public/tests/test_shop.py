@@ -656,8 +656,9 @@ class ShopControls(unittest.TestCase):
                 raise AssertionError((method, path))
 
             def runner(args, source=None):
-                if "node" not in args:
+                if "exec" not in args:
                     return ""
+                self.assertEqual(args[-3], shop.FRONTEND_NODE)
                 script = args[-1]
                 user = json.loads(script.split("const userId = ", 1)[1].split(";", 1)[0])
                 actor = "actor-A" if "actor-A" in script else "actor-B"
@@ -723,6 +724,15 @@ class ShopControls(unittest.TestCase):
                 hashlib.sha256(outcome["ordered_client_results"][0]["raw_response"].encode()).hexdigest(),
                 outcome["ordered_client_results"][0]["raw_response_sha256"],
             )
+            second = outcome["ordered_client_results"][1]
+            self.assertEqual(
+                hashlib.sha256(second["delete_raw_response"].encode()).hexdigest(),
+                second["delete_raw_response_sha256"],
+            )
+            self.assertEqual(
+                hashlib.sha256(second["read_raw_response"].encode()).hexdigest(),
+                second["read_raw_response_sha256"],
+            )
 
     def test_shared_cart_client_failure_stays_unknown_and_cannot_reset(self):
         shop = ShopControls().module()
@@ -740,8 +750,9 @@ class ShopControls(unittest.TestCase):
                 raise AssertionError((method, path))
 
             def fail_second_client(args, source=None):
-                if "node" not in args:
+                if "exec" not in args:
                     return ""
+                self.assertEqual(args[-3], shop.FRONTEND_NODE)
                 script = args[-1]
                 user = json.loads(script.split("const userId = ", 1)[1].split(";", 1)[0])
                 if "actor-A" in script:
