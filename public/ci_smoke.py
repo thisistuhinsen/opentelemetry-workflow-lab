@@ -881,6 +881,78 @@ def browser_checkout_diagnostic(browser, valkey, comparison):
     }
 
 
+class BrowserCheckoutFailure(RuntimeError):
+    def __init__(self, phase, diagnostic):
+        super().__init__("Browser checkout failed; result remains UNKNOWN.")
+        self.phase = phase
+        self.diagnostic = diagnostic
+
+
+def campaign_failure_diagnostic(summary, phase):
+    """Expose a bounded public summary without shopper IDs or raw evidence."""
+    catalog = summary.get("stories", [])
+    catalog = [
+        name for name in catalog if isinstance(name, str) and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", name)
+    ]
+    rows = summary.get("story_results", [])
+    rows = [row for row in rows if isinstance(row, dict)]
+    story_status = []
+    for story in catalog:
+        matched = [row for row in rows if row.get("story") == story]
+        observers = [row.get("independent_valkey_observation") for row in matched]
+        observers = [row for row in observers if isinstance(row, dict)]
+        status = "REPLAYED" if len(matched) >= 2 else "OBSERVED_ONCE" if matched else "NOT_RUN"
+        item = {"story": story, "status": status, "results": len(matched)}
+        if observers:
+            observation = observers[-1]
+            observer_status = observation.get("status")
+            item["valkey_status"] = (
+                observer_status if observer_status in ("MATCHED", "UNKNOWN", "CONTRADICTED") else "UNKNOWN"
+            )
+            reason = observation.get("reason")
+            if isinstance(reason, str) and re.fullmatch(r"[a-z][a-z0-9-]{0,100}", reason):
+                item["valkey_reason"] = reason
+        story_status.append(item)
+    replay_status = (
+        summary.get("agent_replay", {}).get("status")
+        if isinstance(summary.get("agent_replay"), dict)
+        else None
+    )
+    if replay_status not in ("PENDING", "NOT_REQUESTED", "RUNNING", "UNKNOWN", "NOT_RUN", "FIXTURE_REPLAY"):
+        replay_status = "UNKNOWN"
+    diagnostic = {
+        "status": "FAILED",
+        "phase": phase
+        if isinstance(phase, str) and re.fullmatch(r"[a-z][a-z0-9:_-]{0,95}", phase)
+        else "unknown",
+        "stories": story_status,
+        "agent_replay_status": replay_status,
+    }
+    browser = summary.get("browser_checkout_diagnostic")
+    if isinstance(browser, dict):
+        diagnostic["browser_checkout"] = {
+            key: browser.get(key)
+            for key in (
+                "browser_status",
+                "checkout_request_count",
+                "checkout_http_status",
+                "order_response_present",
+                "cart_http_status",
+                "cart_before_item_count",
+                "cart_after_item_count",
+                "valkey_status",
+                "valkey_reason",
+                "valkey_comparison",
+                "valkey_failure_byte_offset",
+                "valkey_failure_payload_bytes",
+                "failure_predicate",
+                "browser_cleanup_status",
+            )
+            if key in browser
+        }
+    return diagnostic
+
+
 def run_browser_checkout(state, *, on_prepared, on_dispatch, browser_timeout_ms=30000):
     """Perform one real Chromium checkout with fictional data and loopback-only requests."""
     from playwright.sync_api import sync_playwright
@@ -920,8 +992,11 @@ def run_browser_checkout(state, *, on_prepared, on_dispatch, browser_timeout_ms=
         "status": "UNKNOWN",
     }
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
+        browser = None
+        browser_phase = "browser-launch"
         try:
+            browser = playwright.chromium.launch(headless=True)
+            browser_phase = "browser-setup"
             context = browser.new_context()
             context.add_init_script(
                 "if (location.origin !== 'null') localStorage.setItem('session', "
@@ -951,7 +1026,9 @@ def run_browser_checkout(state, *, on_prepared, on_dispatch, browser_timeout_ms=
                     on_dispatch(user)
 
             page.on("request", on_request)
+            browser_phase = "page-navigation"
             page.goto(base_url + "/cart", wait_until="domcontentloaded")
+            browser_phase = "form-entry"
             page.locator("#email").fill(fixture["email"])
             page.locator("#street_address").fill(fixture["address"]["streetAddress"])
             page.locator("#zip_code").fill(fixture["address"]["zipCode"])
@@ -968,6 +1045,7 @@ def run_browser_checkout(state, *, on_prepared, on_dispatch, browser_timeout_ms=
             page.locator("#credit_card_expiration_year").select_option(
                 str(fixture["creditCard"]["creditCardExpirationYear"])
             )
+            browser_phase = "checkout-submit"
             with page.expect_response(
                 lambda response: urlsplit(response.url).path == "/api/checkout", timeout=browser_timeout_ms
             ) as response_info:
@@ -975,7 +1053,9 @@ def run_browser_checkout(state, *, on_prepared, on_dispatch, browser_timeout_ms=
             response = response_info.value
             payload = response.json()
             order_present = isinstance(payload, dict) and bool(payload.get("orderId"))
+            browser_phase = "receipt-validation"
             page.get_by_text("Your order is complete!", exact=True).wait_for()
+            browser_phase = "checkout-response-predicate"
             if (
                 len(checkout_requests) != 1
                 or response.status != 200
@@ -985,10 +1065,12 @@ def run_browser_checkout(state, *, on_prepared, on_dispatch, browser_timeout_ms=
                 raise RuntimeError(
                     "browser predicate failed: expected one checkout request, HTTP 200 order, and checkout receipt page"
                 )
+            browser_phase = "cart-readback"
             after_status, after = shop_app.request(
                 state["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD"
             )
             after_items = shop_app.cart_items(after, expected_user=user) if after_status == 200 else None
+            browser_phase = "cart-response-predicate"
             browser_result.update(
                 status="API_AND_BROWSER_OBSERVED" if after_items == [] else "UNKNOWN",
                 checkout_request_count=len(checkout_requests),
@@ -1003,15 +1085,42 @@ def run_browser_checkout(state, *, on_prepared, on_dispatch, browser_timeout_ms=
             )
             return browser_result
         except Exception as error:
-            if checkout_requests:
-                raise RuntimeError(
-                    "Browser checkout failed after dispatch; outcome UNKNOWN, no retry was made."
-                ) from error
-            raise RuntimeError(
-                "Browser checkout failed before dispatch; no checkout was attempted."
-            ) from error
+            response_status = getattr(locals().get("response"), "status", None)
+            if type(response_status) is not int or not 100 <= response_status <= 599:
+                response_status = None
+            diagnostic = {
+                "browser_status": "UNKNOWN",
+                "checkout_request_count": len(checkout_requests),
+                "checkout_http_status": response_status,
+                "order_response_present": locals().get("order_present")
+                if isinstance(locals().get("order_present"), bool)
+                else None,
+                "cart_http_status": locals().get("after_status")
+                if type(locals().get("after_status")) is int
+                else None,
+                "cart_before_item_count": len(before_items) if isinstance(before_items, list) else None,
+                "cart_after_item_count": len(locals().get("after_items"))
+                if isinstance(locals().get("after_items"), list)
+                else None,
+                "failure_predicate": browser_phase,
+            }
+            raise BrowserCheckoutFailure(browser_phase, diagnostic) from error
         finally:
-            browser.close()
+            if browser is not None:
+                pending_error = sys.exception()
+                try:
+                    browser.close()
+                except Exception as close_error:
+                    if isinstance(pending_error, BrowserCheckoutFailure):
+                        pending_error.diagnostic["browser_cleanup_status"] = "UNKNOWN"
+                    else:
+                        diagnostic = browser_checkout_diagnostic(browser_result, {}, "UNKNOWN")
+                        diagnostic.update(
+                            browser_status="UNKNOWN",
+                            failure_predicate="browser-close",
+                            browser_cleanup_status="UNKNOWN",
+                        )
+                        raise BrowserCheckoutFailure("browser-close", diagnostic) from close_error
 
 
 def observe_same_world_restart(campaign, result, before):
@@ -1535,6 +1644,48 @@ def self_test():
             self.assertNotIn("actor_id", diagnostic)
             self.assertEqual(diagnostic["valkey_failure_byte_offset"], 1)
             self.assertEqual(diagnostic["valkey_failure_payload_bytes"], 1)
+
+        def test_campaign_failure_diagnostic_is_identity_free_and_predicate_scoped(self):
+            shopper = "shop-11111111-1111-4111-8111-111111111111"
+            diagnostic = campaign_failure_diagnostic(
+                {
+                    "stories": ["normal-checkout", "cart-failure"],
+                    "story_results": [
+                        {
+                            "story": "normal-checkout",
+                            "synthetic_shopper_id": shopper,
+                            "independent_valkey_observation": {
+                                "status": "UNKNOWN",
+                                "reason": "valkey-payload-length-mismatch",
+                            },
+                        }
+                    ],
+                    "browser_checkout_diagnostic": {
+                        "browser_status": "API_AND_BROWSER_OBSERVED",
+                        "valkey_status": "UNKNOWN",
+                        "valkey_reason": "valkey-payload-length-mismatch",
+                        "cart_before_item_count": 1,
+                        "cart_after_item_count": 0,
+                        "failure_predicate": "checkout-response-predicate",
+                        "browser_cleanup_status": "UNKNOWN",
+                    },
+                    "agent_replay": {"status": "NOT_RUN"},
+                    "error": "Do not print this raw error or shopper " + shopper,
+                },
+                "browser-valkey-readback",
+            )
+            encoded = json.dumps(diagnostic)
+            self.assertEqual(diagnostic["phase"], "browser-valkey-readback")
+            self.assertEqual(diagnostic["stories"][0]["valkey_status"], "UNKNOWN")
+            self.assertEqual(diagnostic["stories"][0]["valkey_reason"], "valkey-payload-length-mismatch")
+            self.assertEqual(diagnostic["stories"][1]["status"], "NOT_RUN")
+            self.assertEqual(
+                diagnostic["browser_checkout"]["failure_predicate"], "checkout-response-predicate"
+            )
+            self.assertEqual(diagnostic["browser_checkout"]["browser_cleanup_status"], "UNKNOWN")
+            self.assertNotIn(shopper, encoded)
+            self.assertNotIn("Do not print", encoded)
+            self.assertNotIn("error", encoded)
 
         def test_campaign_action_supplies_bound_cart_to_same_world_restart(self):
             user = "shop-11111111-1111-4111-8111-111111111111"
@@ -2251,6 +2402,7 @@ def main(argv=None):
         "agent_replay": {"status": "PENDING" if args.agent_replay else "NOT_REQUESTED"},
     }
     success = False
+    failure_phase = "campaign-preflight"
     try:
         if (campaign.state / "state.json").exists() or (campaign.state / "active.json").exists():
             raise ValueError(
@@ -2265,6 +2417,7 @@ def main(argv=None):
             runtime_lock_sha256=sha256(PUBLIC / "runtime-images.lock.json"),
             disk_free_bytes=shutil.disk_usage(ROOT).free,
         )
+        failure_phase = "docker-context"
         context = args.context
         if not context:
             context = subprocess.run(
@@ -2273,12 +2426,14 @@ def main(argv=None):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", context):
             raise ValueError("Docker context name is invalid.")
         summary["docker_context"] = context
+        failure_phase = "pinned-image-census"
         cold_census(
             context,
             read_json(PUBLIC / "runtime-images.lock.json"),
             campaign.receipts / "required-image-cold-census.json",
         )
         campaign.cli("setup", "--context", context, *(["--agent-replay"] if args.agent_replay else []))
+        failure_phase = "service-start"
         campaign.cli("start", next(iter(catalog)))
 
         def mark_browser_dispatch(user):
@@ -2298,9 +2453,11 @@ def main(argv=None):
             }
             write_json(active_state_path(campaign.state), state)
 
+        failure_phase = "browser-checkout"
         browser_result = run_browser_checkout(
             active_state(campaign.state), on_prepared=mark_browser_prepared, on_dispatch=mark_browser_dispatch
         )
+        failure_phase = "browser-valkey-readback"
         browser_state = active_state(campaign.state)
         browser_observation = shop_app.read_valkey_cart(browser_state, browser_result["synthetic_shopper_id"])
         browser_comparison = shop_app.compare_valkey_cart(
@@ -2331,7 +2488,9 @@ def main(argv=None):
         write_json(campaign.receipts / "campaign.json", summary)
 
         for story in catalog:
+            failure_phase = "catalog-story:" + story
             first = campaign.action(["story", story], story)
+            failure_phase = "catalog-valkey-readback:" + story
             story_state = active_state(campaign.state)
             run_path = campaign.evidence / first["run"]
             result = read_json(run_path.parent / "result.json")
@@ -2345,12 +2504,15 @@ def main(argv=None):
                 )
             previous = active_state(campaign.state)
             if story == "shared-cart-conflict":
+                failure_phase = "same-world-restart"
                 observation = observe_same_world_restart(campaign, first, previous)
                 summary["same_world_restart_observation"] = observation
                 previous = active_state(campaign.state)
+            failure_phase = "catalog-reset:" + story
             campaign.cli("reset")
             reset = active_state(campaign.state)
             assert_fresh(previous, reset, context, empty=True)
+            failure_phase = "catalog-replay:" + story
             replay_result = campaign.action(["replay"], story)
             summary["story_results"].append(replay_result)
             if first["semantic_outcome"] != replay_result["semantic_outcome"]:
@@ -2361,6 +2523,7 @@ def main(argv=None):
                 raise RuntimeError("Explicit replay reused the first story shopper.")
             write_json(campaign.receipts / "campaign.json", summary)
         if args.agent_replay:
+            failure_phase = "agent-fixture-replay"
             summary["agent_replay"] = {"status": "RUNNING"}
             write_json(campaign.receipts / "campaign.json", summary)
             prior_runs = set((campaign.evidence / "runs").glob("*/run.json"))
@@ -2402,6 +2565,9 @@ def main(argv=None):
             write_json(campaign.receipts / "campaign.json", summary)
         success = True
     except Exception as error:
+        if isinstance(error, BrowserCheckoutFailure):
+            failure_phase = "browser-" + error.phase
+            summary["browser_checkout_diagnostic"] = error.diagnostic
         summary["error"] = safe_failure_detail(str(error), limit=300)
         if summary.get("agent_replay", {}).get("status") == "RUNNING":
             summary["agent_replay"] = {
@@ -2416,7 +2582,23 @@ def main(argv=None):
         summary["catalog_status"] = catalog_status_matrix(
             summary, summary.get("stories", []), summary["error"]
         )
-        print("Shop CI stopped: " + summary["error"], file=sys.stderr)
+        diagnostic = campaign_failure_diagnostic(summary, failure_phase)
+        summary["failure_diagnostic"] = diagnostic
+        diagnostic_json = json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
+        annotation_json = diagnostic_json.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(
+            "::error title=Workflow Lab bounded failure::" + annotation_json,
+            file=sys.stderr,
+            flush=True,
+        )
+        step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if step_summary:
+            try:
+                with Path(step_summary).open("a", encoding="utf-8") as stream:
+                    stream.write("### Bounded campaign failure\n\n```json\n")
+                    stream.write(diagnostic_json + "\n```\n")
+            except OSError:
+                pass
     finally:
         cleaned = campaign.cleanup()
         summary.update(

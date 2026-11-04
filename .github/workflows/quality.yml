@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: sample-checks-${{ github.ref }}
+  group: sample-checks-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
