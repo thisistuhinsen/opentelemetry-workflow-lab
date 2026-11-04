@@ -576,6 +576,19 @@ def semantic_outcome(result):
             "host_cart_contents": result.get("host_cart_after"),
             "cart_identity_observations": result.get("cart_identity_observations"),
         }
+    if story == "shared-cart-overlap":
+        clients = result.get("concurrent_client_results", [])
+        return {
+            **common,
+            "client_request_windows_overlapped": result.get("concurrency_claim")
+            == "CLIENT_REQUEST_WINDOWS_OVERLAPPED_SERVER_HANDLER_OVERLAP_NOT_ESTABLISHED",
+            "client_statuses": [row.get("status") for row in clients],
+            "final_cart_observation_recorded": result.get("final_cart_observation")
+            in {
+                "BOTH_ITEMS_RETAINED",
+                "ONE_UPDATE_NOT_PRESENT",
+            },
+        }
     raise ValueError("No stable semantic comparison is defined for this story.")
 
 
@@ -950,6 +963,25 @@ def self_test():
             }
             self.assertEqual(semantic_outcome(first), semantic_outcome(replay))
             replay["MCP_carts_by_synthetic_actor"]["fresh-two"] = []
+            self.assertNotEqual(semantic_outcome(first), semantic_outcome(replay))
+
+        def test_overlap_replay_compares_observation_completeness_not_race_outcome(self):
+            first = {
+                "story": "shared-cart-overlap",
+                "assessment": {"passed": True, "expected": "overlap-observed"},
+                "concurrency_claim": "CLIENT_REQUEST_WINDOWS_OVERLAPPED_SERVER_HANDLER_OVERLAP_NOT_ESTABLISHED",
+                "concurrent_client_results": [
+                    {"status": 200},
+                    {"status": 200},
+                ],
+                "final_cart_observation": "BOTH_ITEMS_RETAINED",
+            }
+            replay = {
+                **first,
+                "final_cart_observation": "ONE_UPDATE_NOT_PRESENT",
+            }
+            self.assertEqual(semantic_outcome(first), semantic_outcome(replay))
+            replay["concurrency_claim"] = "SERVER_HANDLER_OVERLAP_PROVEN"
             self.assertNotEqual(semantic_outcome(first), semantic_outcome(replay))
 
         def test_identity_evidence_changes_stable_comparison(self):

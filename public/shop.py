@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -154,6 +155,57 @@ def assess_story(story, outcome):
             }
             and outcome.get("actor_identity") == "HARNESS_LABELS_ONLY_NOT_APPLICATION_AUTHENTICATION"
             and outcome.get("concurrency_claim") == "SEQUENTIALLY_ORDERED_NOT_OVERLAP_TESTED"
+        )
+    elif expected == "overlap-observed":
+        intents = outcome.get("actor_intents", [])
+        clients = outcome.get("concurrent_client_results", [])
+        final_items = outcome.get("cart_after")
+        requested_items = [row.get("item") for row in clients]
+        valid_final_state = (
+            isinstance(final_items, list)
+            and all(item in requested_items for item in final_items)
+            and len({item.get("product_id") for item in final_items}) == len(final_items)
+        )
+        passed = (
+            before == []
+            and len(intents) == 2
+            and len(clients) == 2
+            and [row.get("actor_label") for row in clients] == ["actor-A", "actor-B"]
+            and [row.get("intent") for row in intents] == ["add-distinct-item", "add-distinct-item"]
+            and sorted(row.get("actor_label") for row in intents) == ["actor-A", "actor-B"]
+            and [row.get("sequence") for row in sorted(intents, key=lambda row: row.get("sequence", 0))]
+            == [1, 2]
+            and all(row.get("shared_user_id") == intents[0].get("shared_user_id") for row in intents)
+            and all(row.get("status") == 200 for row in clients)
+            and all(
+                row.get("client_response_identity_status") == "MATCHED_REQUESTED_SHOPPER"
+                and isinstance(row.get("client_response_items"), list)
+                and all(
+                    item.get("product_id") in {requested["product_id"] for requested in requested_items}
+                    for item in row["client_response_items"]
+                )
+                for row in clients
+            )
+            and all(
+                type(row.get("request_start_monotonic_ns")) is int
+                and type(row.get("response_complete_monotonic_ns")) is int
+                and 0 < row["request_start_monotonic_ns"] < row["response_complete_monotonic_ns"]
+                for row in clients
+            )
+            and max(row["request_start_monotonic_ns"] for row in clients)
+            < min(row["response_complete_monotonic_ns"] for row in clients)
+            and all(
+                hashlib.sha256(row.get("raw_response", "").encode()).hexdigest()
+                == row.get("raw_response_sha256")
+                for row in clients
+            )
+            and outcome.get("cart_HTTP_status") == 200
+            and valid_final_state
+            and outcome.get("concurrency_claim")
+            == "CLIENT_REQUEST_WINDOWS_OVERLAPPED_SERVER_HANDLER_OVERLAP_NOT_ESTABLISHED"
+            and outcome.get("actor_identity") == "HARNESS_LABELS_ONLY_NOT_APPLICATION_AUTHENTICATION"
+            and outcome.get("cart_identity_observation")
+            in ("MATCHED_REQUESTED_SHOPPER", "NOT_ECHOED_FOR_EMPTY_CART")
         )
     else:
         raise ValueError("Story expected outcome is unsupported.")
@@ -815,10 +867,11 @@ def run_shared_cart_conflict(state, directory, user, product, runner, http):
         raise ValueError("The catalogue did not provide distinct products for the conflict case.")
 
     actor_a_source = """const crypto = require('node:crypto');
+const frontendOrigin = 'http://' + require('node:os').hostname() + ':' + process.env.PORT;
 const userId = USER_ID;
 const productId = PRODUCT_ID;
 async function main() {
-  const response = await fetch('http://127.0.0.1:8080/api/cart?currencyCode=USD', {
+  const response = await fetch(frontendOrigin + '/api/cart?currencyCode=USD', {
     method: 'POST', headers: {'content-type': 'application/json'},
     body: JSON.stringify({userId, item: {productId, quantity: 1}})
   });
@@ -853,6 +906,7 @@ main().catch(error => {
         raise RuntimeError("First client did not observe its expected cart write; state is unknown.")
 
     actor_b_source = """const crypto = require('node:crypto');
+const frontendOrigin = 'http://' + require('node:os').hostname() + ':' + process.env.PORT;
 const userId = USER_ID;
 async function record(response) {
   const raw = await response.text();
@@ -860,10 +914,10 @@ async function record(response) {
     raw_response_sha256: crypto.createHash('sha256').update(raw).digest('hex')};
 }
 async function main() {
-  const deleted = await record(await fetch('http://127.0.0.1:8080/api/cart', {
+  const deleted = await record(await fetch(frontendOrigin + '/api/cart', {
     method: 'DELETE', headers: {'content-type': 'application/json'}, body: JSON.stringify({userId})
   }));
-  const read = await record(await fetch('http://127.0.0.1:8080/api/cart?sessionId=' + encodeURIComponent(userId) + '&currencyCode=USD'));
+  const read = await record(await fetch(frontendOrigin + '/api/cart?sessionId=' + encodeURIComponent(userId) + '&currencyCode=USD'));
   process.stdout.write(JSON.stringify({actor_label: 'actor-B', intent: 'clear-shared-cart', delete: deleted, read}) + '\\n');
 }
 main().catch(error => {
@@ -932,6 +986,132 @@ main().catch(error => {
     }
 
 
+def run_shared_cart_overlap(state, directory, user, products, runner, http):
+    """Observe overlapping client request windows for two updates to one cart."""
+    initial_status, initial = http(
+        state["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD"
+    )
+    if initial_status != 200 or cart_items(initial, expected_user=user):
+        raise ValueError("Shared-cart overlap requires a verified empty prestate; no actor ran.")
+    if len(products) < 2 or products[0] == products[1]:
+        raise ValueError("The catalogue did not provide two distinct products for the overlap case.")
+
+    def source(actor, product):
+        return (
+            """const crypto = require('node:crypto');
+const frontendOrigin = 'http://' + require('node:os').hostname() + ':' + process.env.PORT;
+const userId = USER_ID;
+const productId = PRODUCT_ID;
+async function main() {
+  const request_start_monotonic_ns = String(process.hrtime.bigint());
+  const response = await fetch(frontendOrigin + '/api/cart?currencyCode=USD', {
+    method: 'POST', headers: {'content-type': 'application/json'},
+    body: JSON.stringify({userId, item: {productId, quantity: 1}})
+  });
+  const raw_response = await response.text();
+  const response_complete_monotonic_ns = String(process.hrtime.bigint());
+  process.stdout.write(JSON.stringify({actor_label: ACTOR, intent: 'add-distinct-item', status: response.status,
+    request_start_monotonic_ns, response_complete_monotonic_ns, raw_response,
+    raw_response_sha256: crypto.createHash('sha256').update(raw_response).digest('hex')}) + '\\n');
+}
+main().catch(error => {
+  const cause = error && error.cause ? `; cause=${String(error.cause)}` : '';
+  console.error(`${String(error)}${cause}`);
+  process.exitCode = 1;
+});
+""".replace("USER_ID", json.dumps(user))
+            .replace("PRODUCT_ID", json.dumps(product))
+            .replace("ACTOR", json.dumps(actor))
+        )
+
+    sources = [source("actor-A", products[0]), source("actor-B", products[1])]
+    state["users"][user] = {"status": "DISPATCHED", "story": "shared-cart-overlap"}
+    write_json(directory / "state.json", state)
+    commands = [
+        compose_args(state, ["exec", "-T", "frontend", FRONTEND_NODE, "-e", script]) for script in sources
+    ]
+    # Separate Compose execs provide two independent client processes. The
+    # monotonic request windows, not thread start order, determine overlap.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(runner, command) for command in commands]
+        actor_results = [json.loads(future.result()) for future in futures]
+    actor_results.sort(key=lambda row: row.get("actor_label", ""))
+    if [row.get("actor_label") for row in actor_results] != ["actor-A", "actor-B"]:
+        raise RuntimeError("Concurrent shared-cart client identity is missing; state is unknown.")
+    for row in actor_results:
+        for key in ("request_start_monotonic_ns", "response_complete_monotonic_ns"):
+            value = row.get(key)
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,20}", value):
+                raise RuntimeError("Concurrent shared-cart timing is missing or malformed; state is unknown.")
+            row[key] = int(value)
+        if hashlib.sha256(row.get("raw_response", "").encode()).hexdigest() != row.get("raw_response_sha256"):
+            raise RuntimeError("Concurrent shared-cart response is unbound; state is unknown.")
+        if row.get("status") != 200:
+            raise RuntimeError("A concurrent shared-cart update failed; state is unknown.")
+        try:
+            client_response = json.loads(row.get("raw_response", ""))
+            row["client_response_items"] = cart_items(client_response, expected_user=user)
+            row["client_response_identity_status"] = cart_identity_status(client_response, user)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                "Concurrent shared-cart client response is malformed or stale; state is unknown."
+            ) from error
+        if any(item["product_id"] not in products for item in row["client_response_items"]):
+            raise RuntimeError(
+                "Concurrent shared-cart response contains an unrequested item; state is unknown."
+            )
+
+    observer_status, observer = http(
+        state["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD"
+    )
+    observed_items = cart_items(observer, expected_user=user) if observer_status == 200 else None
+    expected = [
+        {"product_id": products[0], "quantity": 1},
+        {"product_id": products[1], "quantity": 1},
+    ]
+    final_product_ids = (
+        {row["product_id"] for row in observed_items} if isinstance(observed_items, list) else set()
+    )
+    return {
+        "story": "shared-cart-overlap",
+        "cart_before": [],
+        "cart_after": observed_items,
+        "cart_HTTP_status": observer_status,
+        "actor_intents": [
+            {
+                "sequence": index + 1,
+                "actor_label": row["actor_label"],
+                "intent": "add-distinct-item",
+                "shared_user_id": user,
+                "request_start_monotonic_ns": row["request_start_monotonic_ns"],
+            }
+            for index, row in enumerate(
+                sorted(actor_results, key=lambda item: item["request_start_monotonic_ns"])
+            )
+        ],
+        "concurrent_client_results": [
+            {
+                **row,
+                "item": expected[index],
+            }
+            for index, row in enumerate(actor_results)
+        ],
+        "final_cart_observation": (
+            "BOTH_ITEMS_RETAINED"
+            if final_product_ids == set(products)
+            else "ONE_UPDATE_NOT_PRESENT"
+            if isinstance(observed_items, list) and final_product_ids.issubset(set(products))
+            else "UNKNOWN"
+        ),
+        "cart_identity_observation": cart_identity_status(observer, user)
+        if observer_status == 200
+        else "UNKNOWN",
+        "actor_identity": "HARNESS_LABELS_ONLY_NOT_APPLICATION_AUTHENTICATION",
+        "concurrency_claim": "CLIENT_REQUEST_WINDOWS_OVERLAPPED_SERVER_HANDLER_OVERLAP_NOT_ESTABLISHED",
+        "runtime_qualification": "OBSERVATION_ONLY_NO_SERVER_CONCURRENCY_OR_AUTHORIZATION_CLAIM",
+    }
+
+
 def run_story(state, directory, user, fixture=None, http=request, runner=native):
     validate_user(user)
     if user in state["users"]:
@@ -960,9 +1140,11 @@ def run_story(state, directory, user, fixture=None, http=request, runner=native)
         try:
             if len(products) < 2:
                 raise ValueError("The catalogue did not provide two products for the shared-cart conflict.")
-            outcome = run_shared_cart_conflict(
-                state, directory, user, [products[0]["id"], products[1]["id"]], runner, http
-            )
+            product_ids = [products[0]["id"], products[1]["id"]]
+            if STORIES[story]["expected"] == "overlap-observed":
+                outcome = run_shared_cart_overlap(state, directory, user, product_ids, runner, http)
+            else:
+                outcome = run_shared_cart_conflict(state, directory, user, product_ids, runner, http)
         except Exception:
             status = state["users"][user].get("status")
             state["users"][user] = {
@@ -1123,9 +1305,10 @@ asyncio.run(main())
             "runtime_qualification": "OBSERVATION_ONLY_NO_SETTLEMENT_OR_RETRY_SAFETY_CLAIM",
         }
     outcome["assessment"] = assess_story(story, outcome)
-    settled = (STORIES[story]["action"] == "mcp-cart" and outcome["assessment"]["passed"]) or (
-        STORIES[story]["action"] != "mcp-cart" and status == 200 and after_status == 200
-    )
+    # A successful transport and an HTTP 200 read do not establish that the
+    # observed state matches the selected case. Keep stale-but-well-formed
+    # responses unobserved when the case assessment fails.
+    settled = outcome["assessment"]["passed"] is True
     state["users"][user] = {"status": "OBSERVED" if settled else "UNKNOWN_AFTER_DISPATCH", "story": story}
     if other_user is not None:
         state["users"][other_user] = {

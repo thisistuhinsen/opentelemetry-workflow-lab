@@ -1,6 +1,7 @@
 """Inert command-boundary controls; never invokes Docker or an application."""
 
 import contextlib
+import copy
 import hashlib
 import importlib.util
 import io
@@ -645,6 +646,7 @@ class ShopControls(unittest.TestCase):
             state = self.state_fixture(shop, root, story="shared-cart-conflict")
             carts = {}
             clients = []
+            client_scripts = []
 
             def http(port, method, path, body=None):
                 if method == "GET" and path.startswith("/api/products"):
@@ -661,6 +663,7 @@ class ShopControls(unittest.TestCase):
                 self.assertEqual(args[-3], shop.FRONTEND_NODE)
                 script = args[-1]
                 self.assertIn("error && error.cause", script)
+                client_scripts.append(script)
                 user = json.loads(script.split("const userId = ", 1)[1].split(";", 1)[0])
                 actor = "actor-A" if "actor-A" in script else "actor-B"
                 clients.append((actor, user))
@@ -706,6 +709,11 @@ class ShopControls(unittest.TestCase):
                     runner=runner,
                 )
             self.assertEqual([actor for actor, _ in clients], ["actor-A", "actor-B"])
+            self.assertEqual(len(client_scripts), 2)
+            for script in client_scripts:
+                self.assertIn("require('node:os').hostname()", script)
+                self.assertIn("process.env.PORT", script)
+                self.assertNotIn("127.0.0.1:8080", script)
             self.assertEqual(clients[0][1], clients[1][1])
             self.assertEqual(outcome["assessment"]["passed"], True)
             self.assertEqual(outcome["actor_intents"][0]["sequence"], 1)
@@ -781,6 +789,70 @@ class ShopControls(unittest.TestCase):
                 shop.reset_subject(
                     failed, user, lambda *args: self.fail("Unknown shared state cannot reset.")
                 )
+
+    def test_shared_cart_overlap_records_only_measured_client_window_overlap(self):
+        shop = ShopControls().module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = self.state_fixture(shop, root, story="shared-cart-overlap")
+            scripts = []
+            calls = []
+            cart_reads = 0
+            user = "shop-11111111-1111-4111-8111-111111111111"
+            product_a, product_b = "demo-product", "other-product"
+
+            def http(port, method, path, body=None):
+                nonlocal cart_reads
+                calls.append((method, path, body))
+                if method == "GET" and path.startswith("/api/products"):
+                    return 200, [{"id": product_a}, {"id": product_b}]
+                if method == "GET" and path.startswith("/api/cart"):
+                    cart_reads += 1
+                    if cart_reads == 1:
+                        return 200, {"items": []}
+                    return 200, {
+                        "userId": user,
+                        "items": [{"productId": product_a, "quantity": 1}],
+                    }
+                raise AssertionError((method, path))
+
+            def runner(args, source=None):
+                self.assertIn("exec", args)
+                self.assertEqual(args[-3], shop.FRONTEND_NODE)
+                script = args[-1]
+                scripts.append(script)
+                actor = "actor-A" if '"actor-A"' in script else "actor-B"
+                product = product_a if product_a in script else product_b
+                raw = json.dumps({"userId": user, "items": [{"productId": product, "quantity": 1}]})
+                start, end = (100, 400) if actor == "actor-A" else (200, 500)
+                return json.dumps(
+                    {
+                        "actor_label": actor,
+                        "intent": "add-distinct-item",
+                        "status": 200,
+                        "request_start_monotonic_ns": str(start),
+                        "response_complete_monotonic_ns": str(end),
+                        "raw_response": raw,
+                        "raw_response_sha256": hashlib.sha256(raw.encode()).hexdigest(),
+                    }
+                )
+
+            outcome = shop.run_story(state, root, user, runner=runner, http=http)
+            self.assertTrue(outcome["assessment"]["passed"])
+            self.assertEqual(len(scripts), 2)
+            self.assertTrue(all("require('node:os').hostname()" in script for script in scripts))
+            self.assertTrue(all("process.env.PORT" in script for script in scripts))
+            self.assertEqual([row["actor_label"] for row in outcome["actor_intents"]], ["actor-A", "actor-B"])
+            self.assertEqual(outcome["final_cart_observation"], "ONE_UPDATE_NOT_PRESENT")
+            self.assertEqual(
+                outcome["concurrency_claim"],
+                "CLIENT_REQUEST_WINDOWS_OVERLAPPED_SERVER_HANDLER_OVERLAP_NOT_ESTABLISHED",
+            )
+            self.assertEqual(state["users"][user]["status"], "OBSERVED")
+
+            nonoverlap = copy.deepcopy(outcome)
+            nonoverlap["concurrent_client_results"][1]["request_start_monotonic_ns"] = 401
+            self.assertFalse(shop.assess_story("shared-cart-overlap", nonoverlap)["passed"])
 
     def test_incomplete_mcp_actor_comparison_stays_unknown_and_cannot_reset(self):
         for failure in ("runner", "malformed", "missing", "extra", "wrong"):
@@ -944,8 +1016,8 @@ class StoryOutcomeControls(unittest.TestCase):
         }
         self.assertFalse(shop.assess_story("normal-checkout", outcome)["passed"])
 
-    def test_unavailable_or_wrong_shopper_readback_stays_unknown_and_cannot_reset(self):
-        for mode in ("unavailable", "wrong-shopper"):
+    def test_unavailable_wrong_shopper_or_stale_readback_stays_unknown_and_cannot_reset(self):
+        for mode in ("unavailable", "wrong-shopper", "stale"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
                 controls = ShopControls()
                 shop = controls.module()
@@ -953,23 +1025,33 @@ class StoryOutcomeControls(unittest.TestCase):
                 controls.state_fixture(shop, root)
                 runner, http, _, requests = controls.adapters(shop)
                 checkout_dispatched = False
+                checkout_user = None
 
                 def degraded_readback(port, method, path, body=None):
-                    nonlocal checkout_dispatched
+                    nonlocal checkout_dispatched, checkout_user
                     if checkout_dispatched and method == "GET" and path.startswith("/api/cart"):
                         if mode == "unavailable":
                             return 503, {}
+                        if mode == "stale":
+                            return 200, {
+                                "userId": checkout_user,
+                                "items": [{"productId": "demo-product", "quantity": 1}],
+                            }
                         return 200, {"userId": "shop-22222222-2222-4222-8222-222222222222", "items": []}
                     result = http(port, method, path, body)
                     if method == "POST" and path.startswith("/api/checkout"):
                         checkout_dispatched = True
+                        checkout_user = body["userId"]
                     return result
 
-                with self.assertRaises(ValueError):
+                with self.assertRaises((ValueError, RuntimeError)):
                     shop.main(["--state-dir", str(root), "story"], runner, degraded_readback)
                 state = json.loads((root / "state.json").read_bytes())
                 user = state["last_user"]
                 self.assertEqual(state["users"][user]["status"], "UNKNOWN_AFTER_DISPATCH")
+                if mode == "stale":
+                    result = json.loads((root / ("result-" + user + ".json")).read_bytes())
+                    self.assertFalse(result["assessment"]["passed"])
                 self.assertEqual(
                     len([row for row in requests if row[0] == "POST" and row[1].startswith("/api/checkout")]),
                     1,

@@ -45,6 +45,15 @@
       "cartFailure": "off",
       "paymentUnreachable": "off",
       "expected": "ordered-conflict"
+    },
+    "shared-cart-overlap": {
+      "title": "Overlapping shared-cart updates",
+      "description": "Record two overlapping client requests that add distinct items to one synthetic cart, then inspect whether both updates remain visible. Client-window overlap does not prove overlap inside the service handler.",
+      "action": "shared-cart",
+      "source_variant": "original",
+      "cartFailure": "off",
+      "paymentUnreachable": "off",
+      "expected": "overlap-observed"
     }
   }
 }

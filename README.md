@@ -15,6 +15,8 @@ shop.cmd story normal
 shop.cmd story cart-failure
 shop.cmd story payment-unreachable
 shop.cmd story mcp-session-id
+shop.cmd story shared-cart-conflict
+shop.cmd story shared-cart-overlap
 shop.cmd reset
 shop.cmd replay
 shop.cmd view
@@ -35,10 +37,13 @@ shop.cmd clean
 | payment-unreachable | Enable the demo payment-unavailable flag | Exactly one checkout request, an error response without an order, and an independently read retained cart; CI also joins the synthetic shopper to a positive checkout error span |
 | mcp-session-id | Seed distinct carts for two synthetic shoppers and read both through HTTP and MCP | Both projections match per shopper and remain distinct |
 | shared-cart-conflict | Launch two sequential clients with harness-only actor labels against one synthetic cart; actor A adds an item, actor B clears it | Ordered raw responses and same-user readback show the later clear; this is not an overlap/concurrency or product-authentication test |
+| shared-cart-overlap | Launch two independent client processes that add distinct items to one synthetic cart; record each client request interval and read the final cart | The case requires measured client request-window overlap and records whether both updates remain; it does not prove overlap inside the service handler or application authorization |
 
 A case passes when its stated observation is reproduced. A harmful case passing does not mean its business behavior is correct. These observations do not establish settlement, fulfillment, durable deduplication or safe retry. A failed or ambiguous attempt remains recorded.
 
-Cart observations are bound to the requested synthetic `userId`; unavailable, malformed, or mismatched-user readbacks remain unknown and cannot be reset as settled. The harness also tests allowed operations on its captured Compose target and denial when target identity drifts. That is harness-scope enforcement, not application authorization. CI resets to a fresh isolated shop and replays each case with fresh identities; it compares stable semantic outcomes while excluding project, shopper, and time IDs.
+Unavailable, malformed, stale-but-well-formed, or mismatched-user readbacks cannot make a failed case `OBSERVED` or authorize a reset. Empty carts that omit `userId` remain explicitly `NOT_ECHOED_FOR_EMPTY_CART`. The harness also tests allowed operations on its captured Compose target and denial when target identity drifts. That is harness-scope enforcement, not application authorization. CI resets to a fresh isolated shop and replays each case with fresh identities; it compares stable semantics while excluding project, shopper, time, and inherently variable race outcomes.
+
+The catalog contains business/runtime observations. Observer-unavailable and stale-readback checks are fail-closed controls exercised by unit tests; allowed/denied scope is a harness control; reset/replay is a repeatability procedure. A no-defect source refactor is a planning/evaluation control, not another demo business story. This sample does not currently automate a real browser checkout, independently inspect Valkey state, or establish same-cart server-handler overlap. Those remain distinct from the HTTP/MCP and client-window observations above.
 
 ## Evidence survives Docker cleanup
 
