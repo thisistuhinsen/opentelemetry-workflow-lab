@@ -19,6 +19,28 @@ sys.path.insert(0, str(PUBLIC))
 
 
 class ShopControls(unittest.TestCase):
+    def test_agent_replay_failure_message_contains_only_allowlisted_fields(self):
+        shop = self.module()
+        secret = "synthetic prompt and credential sentinel"
+        message = shop.agent_replay_failure_message(
+            {
+                "failure_stage": {"untrusted": secret},
+                "error_type": "HTTPError",
+                "cleanup_error_type": "AgentStopUnconfirmed",
+                "cleanup_failure_stage": "agent-stop",
+                "agent_stopped": False,
+                "prompt": secret,
+                "api_key": secret,
+            },
+            "fixture-endpoint",
+        )
+        self.assertIn('"last_observed_stage":"fixture-endpoint"', message)
+        self.assertIn('"error_type":"HTTPError"', message)
+        self.assertIn('"cleanup_error_type":"AgentStopUnconfirmed"', message)
+        self.assertIn('"agent_stopped":false', message)
+        self.assertNotIn(secret, message)
+        self.assertNotIn("api_key", message)
+
     def test_setup_makes_only_public_mounted_flags_guest_readable(self):
         shop = self.module()
         with tempfile.TemporaryDirectory() as temporary:

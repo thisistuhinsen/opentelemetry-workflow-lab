@@ -1830,6 +1830,41 @@ def agent_replay_summary_path(state, directory, evidence_root=None):
     return path
 
 
+AGENT_REPLAY_STAGES = {
+    "world-start",
+    "isolation-config",
+    "agent-start",
+    "container-boundary",
+    "runtime-guard",
+    "fixture-endpoint",
+    "agent-stop",
+    "evidence-artifact",
+}
+
+
+def agent_replay_failure_message(outcome, last_stage):
+    """Produce a safe failure line from fixed fields only; never include payloads."""
+    diagnostic = {"status": "UNKNOWN"}
+    failure_stage = outcome.get("failure_stage")
+    if isinstance(failure_stage, str) and failure_stage in AGENT_REPLAY_STAGES:
+        diagnostic["failure_stage"] = failure_stage
+    elif isinstance(last_stage, str) and last_stage in AGENT_REPLAY_STAGES:
+        diagnostic["last_observed_stage"] = last_stage
+    for field in ("error_type", "cleanup_error_type"):
+        error_type = outcome.get(field)
+        if isinstance(error_type, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", error_type):
+            diagnostic[field] = error_type
+    cleanup_stage = outcome.get("cleanup_failure_stage")
+    if cleanup_stage == "agent-stop":
+        diagnostic["cleanup_failure_stage"] = cleanup_stage
+    if type(outcome.get("agent_stopped")) is bool:
+        diagnostic["agent_stopped"] = outcome["agent_stopped"]
+    return (
+        "Agent cassette replay is UNKNOWN; no external model call or retry was allowed; diagnostic="
+        + json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
+    )
+
+
 def run_agent_replay(state, directory, runner=native, http=request):
     """Exercise one pinned cassette with a dummy key, loopback endpoint and internal network."""
     if state.get("agent_replay_enabled") is not True:
@@ -2055,7 +2090,7 @@ print(json.dumps({'http_status':status,'tool_names':sorted(set(tool_names)),'mes
                 _RECORDER.result(outcome)
                 successful = False
     if not successful or outcome.get("agent_stopped") is not True:
-        raise RuntimeError("Agent cassette replay is UNKNOWN; no external model call or retry was allowed.")
+        raise RuntimeError(agent_replay_failure_message(outcome, stage))
     return outcome
 
 
