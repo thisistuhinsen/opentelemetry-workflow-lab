@@ -728,6 +728,16 @@ def active_state_path(base):
     return directory / "state.json"
 
 
+def run_agent_replay_command(campaign):
+    """Run replay only in a world whose prepared state binds its overlay/network."""
+    state = active_state(campaign.state)
+    if state.get("agent_replay_enabled") is not True:
+        raise ValueError("The active campaign world was not prepared for fixture replay.")
+    prior_runs = set((campaign.evidence / "runs").glob("*/run.json"))
+    campaign.cli("agent-replay")
+    return prior_runs
+
+
 def assert_fresh(before, after, context, *, empty=False):
     if before["project"] == after["project"] or after["docker_context"] != context:
         raise RuntimeError("Reset/replay did not preserve context and create a fresh shop.")
@@ -1799,6 +1809,31 @@ def self_test():
                 )
             )
 
+        def test_agent_replay_runs_only_in_initially_prepared_world(self):
+            self.campaign.state.mkdir(parents=True)
+            state = {"agent_replay_enabled": False, "project": "shop-0123456789ab"}
+            write_json(self.campaign.state / "state.json", state)
+            calls = []
+            self.campaign.cli = lambda *args: calls.append(args)
+            with self.assertRaisesRegex(ValueError, "not prepared for fixture replay"):
+                run_agent_replay_command(self.campaign)
+            self.assertEqual(calls, [])
+
+            state["agent_replay_enabled"] = True
+            write_json(self.campaign.state / "state.json", state)
+            existing = self.campaign.evidence / "runs" / "existing"
+            write_json(existing / "run.json", {"command": "story"})
+
+            def record_replay(*args):
+                calls.append(args)
+                fresh = self.campaign.evidence / "runs" / "agent-replay"
+                write_json(fresh / "run.json", {"command": "agent-replay"})
+
+            self.campaign.cli = record_replay
+            prior = run_agent_replay_command(self.campaign)
+            self.assertEqual(calls, [("agent-replay",)])
+            self.assertEqual(prior, {existing / "run.json"})
+
         def test_semantic_mcp_repeatability_ignores_actor_ids_not_cart_mismatch(self):
             first = {
                 "story": "mcp-session-id",
@@ -2436,6 +2471,47 @@ def main(argv=None):
         failure_phase = "service-start"
         campaign.cli("start", next(iter(catalog)))
 
+        if args.agent_replay:
+            failure_phase = "agent-fixture-replay"
+            summary["agent_replay"] = {"status": "RUNNING"}
+            write_json(campaign.receipts / "campaign.json", summary)
+            prior_runs = run_agent_replay_command(campaign)
+            new_runs = {
+                path
+                for path in set((campaign.evidence / "runs").glob("*/run.json")) - prior_runs
+                if read_json(path).get("command") == "agent-replay"
+            }
+            if len(new_runs) != 1:
+                raise RuntimeError("The agent fixture replay did not produce one durable command result.")
+            run_path = new_runs.pop()
+            agent_run = read_json(run_path)
+            agent_result = read_json(run_path.parent / "result.json")
+            if not validate_agent_replay_result(
+                agent_run,
+                agent_result,
+                expected_overlay_sha256=sha256(shop_app.AGENT_REPLAY_OVERLAY),
+            ):
+                raise RuntimeError(
+                    "The agent endpoint result did not prove the pinned read-only fixture replay."
+                )
+            summary["agent_replay"] = {
+                "status": "FIXTURE_REPLAY",
+                "run": str(run_path.relative_to(campaign.evidence)),
+                "run_sha256": sha256(run_path),
+                "result_sha256": sha256(run_path.parent / "result.json"),
+                "source_commit": agent_result["source_commit"],
+                "model": agent_result["model"],
+                "cassette_sha256": agent_result["cassette_sha256"],
+                "overlay_sha256": agent_result["overlay_sha256"],
+                "vcrpy_version": agent_result["vcrpy_version"],
+                "record_mode": agent_result["record_mode"],
+                "match_threshold": agent_result["match_threshold"],
+                "tool_names": agent_result["tool_names"],
+                "agent_stopped": True,
+                "live_inference": False,
+            }
+            write_json(campaign.receipts / "campaign.json", summary)
+
         def mark_browser_dispatch(user):
             state = active_state(campaign.state)
             if state.get("users", {}).get(user, {}).get("status") != "PREPARED_NO_CHECKOUT":
@@ -2521,47 +2597,6 @@ def main(argv=None):
             assert_fresh(reset, replay, context)
             if set(previous.get("users", {})) & set(replay.get("users", {})):
                 raise RuntimeError("Explicit replay reused the first story shopper.")
-            write_json(campaign.receipts / "campaign.json", summary)
-        if args.agent_replay:
-            failure_phase = "agent-fixture-replay"
-            summary["agent_replay"] = {"status": "RUNNING"}
-            write_json(campaign.receipts / "campaign.json", summary)
-            prior_runs = set((campaign.evidence / "runs").glob("*/run.json"))
-            campaign.cli("agent-replay")
-            new_runs = {
-                path
-                for path in set((campaign.evidence / "runs").glob("*/run.json")) - prior_runs
-                if read_json(path).get("command") == "agent-replay"
-            }
-            if len(new_runs) != 1:
-                raise RuntimeError("The agent fixture replay did not produce one durable command result.")
-            run_path = new_runs.pop()
-            agent_run = read_json(run_path)
-            agent_result = read_json(run_path.parent / "result.json")
-            if not validate_agent_replay_result(
-                agent_run,
-                agent_result,
-                expected_overlay_sha256=sha256(shop_app.AGENT_REPLAY_OVERLAY),
-            ):
-                raise RuntimeError(
-                    "The agent endpoint result did not prove the pinned read-only fixture replay."
-                )
-            summary["agent_replay"] = {
-                "status": "FIXTURE_REPLAY",
-                "run": str(run_path.relative_to(campaign.evidence)),
-                "run_sha256": sha256(run_path),
-                "result_sha256": sha256(run_path.parent / "result.json"),
-                "source_commit": agent_result["source_commit"],
-                "model": agent_result["model"],
-                "cassette_sha256": agent_result["cassette_sha256"],
-                "overlay_sha256": agent_result["overlay_sha256"],
-                "vcrpy_version": agent_result["vcrpy_version"],
-                "record_mode": agent_result["record_mode"],
-                "match_threshold": agent_result["match_threshold"],
-                "tool_names": agent_result["tool_names"],
-                "agent_stopped": True,
-                "live_inference": False,
-            }
             write_json(campaign.receipts / "campaign.json", summary)
         success = True
     except Exception as error:
