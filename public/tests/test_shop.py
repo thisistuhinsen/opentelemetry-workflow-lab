@@ -1226,12 +1226,18 @@ class StoryOutcomeControls(unittest.TestCase):
         self.assertEqual(empty["identity_basis"], "exact-valkey-hash-key-empty-payload-has-no-user-id")
         self.assertEqual(shop.compare_valkey_cart(user, [], empty), "MATCHED_API_READBACK")
 
-        for output in ("0\n\n", "not-a-count\n\n", "1\n%%%\n", "1\nAQ==\n"):
+        for output, reason in (
+            ("0\n\n", "missing-or-malformed-valkey-readback"),
+            ("not-a-count\n\n", "missing-or-malformed-valkey-readback"),
+            ("1\n%%%\n", "valkey-base64-decode-failed-or-invalid"),
+            ("1\nAQ==\n", "valkey-protobuf-decode-failed-or-invalid"),
+        ):
             with self.subTest(output=output):
                 missing = shop.read_valkey_cart(
                     state, user, lambda args: "engine-test" if "info" in args else output
                 )
                 self.assertEqual(missing["status"], "UNKNOWN")
+                self.assertEqual(missing["reason"], reason)
         unavailable = shop.read_valkey_cart(
             state, user, lambda _args: (_ for _ in ()).throw(OSError("private command detail"))
         )

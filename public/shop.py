@@ -1003,9 +1003,11 @@ def read_valkey_cart(state, user, runner=native):
         rows = output.splitlines()
         if len(rows) != 2 or rows[0] != "1":
             return {"status": "UNKNOWN", "reason": "missing-or-malformed-valkey-readback"}
-        phase = "payload-decode"
+        phase = "base64-decode"
         payload = base64.b64decode(rows[1], validate=True)
+        phase = "protobuf-decode"
         cart = decode_valkey_cart(payload)
+        phase = "payload-identity"
         if cart["user_id"] and cart["user_id"] != user:
             return {"status": "UNKNOWN", "reason": "valkey-payload-user-mismatch"}
         if cart["items"] and cart["user_id"] != user:
