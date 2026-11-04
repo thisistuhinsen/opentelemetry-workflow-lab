@@ -713,6 +713,11 @@ class Campaign:
             default=-1,
         )
         if traceback_start < 0:
+            cli_error_prefix = "Shop could not complete this step: "
+            cli_errors = [line.strip() for line in lines if line.strip().startswith(cli_error_prefix)]
+            if cli_errors:
+                detail = safe_failure_detail(cli_errors[-1][len(cli_error_prefix) :])
+                return f"{summary} error={detail}"
             return summary + " error=terminal exception detail unavailable"
         exception = None
         for line in reversed(lines[traceback_start + 1 :]):

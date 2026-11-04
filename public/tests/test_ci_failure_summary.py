@@ -138,6 +138,34 @@ class FailureSummaryTests(unittest.TestCase):
             )
             self.assertNotIn("raw output", output)
 
+    def test_failed_cli_reads_only_the_shop_error_line_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            campaign = ci_smoke.Campaign(root / "state", root / "evidence")
+            stderr = io.StringIO()
+
+            def failed_cli(argv, *, stdout, **kwargs):
+                stdout.write(
+                    b"Shop could not complete this step: cart read failed for "
+                    b"shopper@example.test; token=secret-value\n"
+                    b"raw response body must not appear\n"
+                )
+                return SimpleNamespace(returncode=1)
+
+            with mock.patch.object(ci_smoke.subprocess, "run", side_effect=failed_cli):
+                with (
+                    contextlib.redirect_stderr(stderr),
+                    self.assertRaisesRegex(RuntimeError, "Shop step failed"),
+                ):
+                    campaign.cli("story", "shared-cart-conflict")
+
+            output = stderr.getvalue()
+            self.assertIn("phase=story status=failed exit=1", output)
+            self.assertIn("cart read failed for [email]; token=[redacted]", output)
+            self.assertNotIn("shopper@example.test", output)
+            self.assertNotIn("secret-value", output)
+            self.assertNotIn("raw response body", output)
+
     def test_missing_run_directory_produces_no_detail(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
