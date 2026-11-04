@@ -1172,15 +1172,22 @@ class StoryOutcomeControls(unittest.TestCase):
                 result += field_bytes(2, item)
             return result
 
+        def readback(payload):
+            cli_output = f"{len(payload):010d}{payload.hex()}\n"
+            normalized = cli_output.replace("\n", "").encode()
+            return base64.b64encode(normalized).decode() + "\n"
+
+        def missing_readback():
+            return base64.b64encode(b"MISSING").decode() + "\n"
+
         raw = cart_bytes(user, [("demo-product", 2)])
-        encoded = base64.b64encode(raw).decode()
         calls = []
 
         def runner(args):
             calls.append(args)
             if "info" in args:
                 return "engine-test"
-            return "1\n" + encoded + "\n"
+            return readback(raw)
 
         observed = shop.read_valkey_cart(state, user, runner)
         self.assertEqual(observed["status"], "OBSERVED")
@@ -1192,9 +1199,21 @@ class StoryOutcomeControls(unittest.TestCase):
         self.assertIn("captured-engine", calls[0])
         self.assertIn("info", calls[0])
         self.assertIn("valkey-cart", calls[1])
-        self.assertIn("HEXISTS", calls[1][-1])
+        self.assertIn("EVAL", calls[1][-1])
         self.assertIn("HGET", calls[1][-1])
+        self.assertIn("HSTRLEN", calls[1][-1])
+        self.assertIn("string.gsub(v", calls[1][-1])
+        self.assertIn("tr -d '\\n' | base64", calls[1][-1])
         self.assertNotIn("VALKEY-CLI --RAW SET ", calls[1][-1].upper())
+
+        newline_payload = cart_bytes(user, [("demo-product\n", 1)])
+        newline_observed = shop.read_valkey_cart(
+            state,
+            user,
+            lambda args: "engine-test" if "info" in args else readback(newline_payload),
+        )
+        self.assertEqual(newline_observed["status"], "OBSERVED")
+        self.assertEqual(newline_observed["items"], [{"product_id": "demo-product\n", "quantity": 1}])
 
         stale = shop.read_valkey_cart(
             state,
@@ -1202,9 +1221,7 @@ class StoryOutcomeControls(unittest.TestCase):
             lambda args: (
                 "engine-test"
                 if "info" in args
-                else "1\n"
-                + base64.b64encode(cart_bytes("shop-22222222-2222-4222-8222-222222222222", [])).decode()
-                + "\n"
+                else readback(cart_bytes("shop-22222222-2222-4222-8222-222222222222", []))
             ),
         )
         self.assertEqual(stale["status"], "UNKNOWN")
@@ -1213,26 +1230,35 @@ class StoryOutcomeControls(unittest.TestCase):
         unbound = shop.read_valkey_cart(
             state,
             user,
-            lambda args: (
-                "engine-test"
-                if "info" in args
-                else "1\n" + base64.b64encode(cart_bytes("", [("demo-product", 1)])).decode() + "\n"
-            ),
+            lambda args: "engine-test" if "info" in args else readback(cart_bytes("", [("demo-product", 1)])),
         )
         self.assertEqual(unbound["status"], "UNKNOWN")
 
-        empty = shop.read_valkey_cart(state, user, lambda args: "engine-test" if "info" in args else "1\n\n")
+        empty = shop.read_valkey_cart(
+            state, user, lambda args: "engine-test" if "info" in args else readback(b"")
+        )
         self.assertEqual(empty["status"], "OBSERVED")
         self.assertEqual(empty["identity_basis"], "exact-valkey-hash-key-empty-payload-has-no-user-id")
         self.assertEqual(shop.compare_valkey_cart(user, [], empty), "MATCHED_API_READBACK")
 
         for output, reason in (
-            ("0\n\n", "missing-or-malformed-valkey-readback"),
-            ("not-a-count\n\n", "missing-or-malformed-valkey-readback"),
-            ("1\n%%%\n", "valkey-base64-decode-failed-or-invalid"),
-            ("1\ngA==\n", "valkey-protobuf-cart-truncated-varint"),
-            ("1\nAQ==\n", "valkey-protobuf-cart-unsupported-or-duplicate-field"),
-            ("1\nEgGA\n", "valkey-protobuf-cart-item-truncated-varint"),
+            (missing_readback(), "missing-or-malformed-valkey-readback"),
+            ("%%%\n", "valkey-base64-decode-failed-or-invalid"),
+            (readback(b"\x80"), "valkey-protobuf-cart-truncated-varint"),
+            (readback(b"\x01"), "valkey-protobuf-cart-unsupported-or-duplicate-field"),
+            (readback(b"\x12\x01\x80"), "valkey-protobuf-cart-item-truncated-varint"),
+            (base64.b64encode(b"0000000000" + b"80").decode() + "\n", "valkey-payload-length-mismatch"),
+            (base64.b64encode(b"0001048577").decode() + "\n", "valkey-readback-exceeds-sample-bound"),
+            (base64.b64encode(b"OVERSIZE").decode() + "\n", "valkey-readback-exceeds-sample-bound"),
+            (base64.b64encode(b"0000000x01").decode() + "\n", "missing-or-malformed-valkey-readback"),
+            (
+                base64.b64encode(b"0000000001zz").decode() + "\n",
+                "valkey-payload-hex-decode-failed-or-invalid",
+            ),
+            (
+                ("A" * 2_796_217) + "\n",
+                "valkey-readback-exceeds-sample-bound",
+            ),
         ):
             with self.subTest(output=output):
                 missing = shop.read_valkey_cart(
@@ -1240,7 +1266,7 @@ class StoryOutcomeControls(unittest.TestCase):
                 )
                 self.assertEqual(missing["status"], "UNKNOWN")
                 self.assertEqual(missing["reason"], reason)
-                if output == "1\ngA==\n":
+                if output == readback(b"\x80"):
                     self.assertEqual(missing["failure_byte_offset"], 1)
                     self.assertEqual(missing["failure_payload_bytes"], 1)
         unavailable = shop.read_valkey_cart(

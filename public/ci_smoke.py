@@ -1479,13 +1479,13 @@ def self_test():
             }
 
             def runner(args):
-                return "engine-test" if "info" in args else "1\n\n"
+                return "engine-test" if "info" in args else "MDAwMDAwMDAwMA==\n"
 
             matched = observe_store_for_result(state, result, runner=runner)
             self.assertEqual(matched["status"], "MATCHED")
             self.assertEqual(set(matched["actors"]), {user_a, user_b})
             missing = observe_store_for_result(
-                state, result, runner=lambda args: "engine-test" if "info" in args else "0\n\n"
+                state, result, runner=lambda args: "engine-test" if "info" in args else "TUlTU0lORw==\n"
             )
             self.assertEqual(missing["status"], "UNKNOWN")
             contradictory = observe_store_for_result(

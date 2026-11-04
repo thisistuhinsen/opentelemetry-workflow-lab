@@ -1008,17 +1008,45 @@ def read_valkey_cart(state, user, runner=native):
             return {"status": "UNKNOWN", "reason": "docker-engine-binding-changed"}
         phase = "container-read"
         quoted_user = shlex.quote(user)
+        lua = (
+            'local n=redis.call("HSTRLEN",KEYS[1],ARGV[1]); '
+            'if n > 1048576 then return "OVERSIZE" end; '
+            'local v=redis.call("HGET",KEYS[1],ARGV[1]); '
+            'if not v then return "MISSING" end; '
+            'local h=string.gsub(v,".",function(c) return string.format("%02x",string.byte(c)) end); '
+            'return string.format("%010d",n) .. h'
+        )
         script = (
             "set -e; "
-            f"valkey-cli --raw HEXISTS {quoted_user} cart; "
-            f"valkey-cli --raw HGET {quoted_user} cart | base64 | tr -d '\\n'; printf '\\n'"
+            f"valkey-cli --raw EVAL {shlex.quote(lua)} 1 {quoted_user} cart "
+            "| tr -d '\\n' | base64 | tr -d '\\n'; printf '\\n'"
         )
         output = runner(compose_args(state, ["exec", "-T", "valkey-cart", "sh", "-c", script]))
         rows = output.splitlines()
-        if len(rows) != 2 or rows[0] != "1":
+        if len(rows) != 1:
             return {"status": "UNKNOWN", "reason": "missing-or-malformed-valkey-readback"}
+        if len(rows[0]) > 2_796_216:
+            return {"status": "UNKNOWN", "reason": "valkey-readback-exceeds-sample-bound"}
         phase = "base64-decode"
-        payload = base64.b64decode(rows[1], validate=True)
+        framed = base64.b64decode(rows[0], validate=True)
+        if framed == b"OVERSIZE":
+            return {"status": "UNKNOWN", "reason": "valkey-readback-exceeds-sample-bound"}
+        if framed == b"MISSING":
+            return {"status": "UNKNOWN", "reason": "missing-or-malformed-valkey-readback"}
+        if len(framed) < 10 or not re.fullmatch(rb"[0-9]{10}", framed[:10]):
+            return {"status": "UNKNOWN", "reason": "missing-or-malformed-valkey-readback"}
+        expected_payload_bytes = int(framed[:10])
+        encoded_payload = framed[10:]
+        if expected_payload_bytes > 1_048_576 or len(encoded_payload) > 2_097_152:
+            return {"status": "UNKNOWN", "reason": "valkey-readback-exceeds-sample-bound"}
+        if len(encoded_payload) != expected_payload_bytes * 2:
+            return {"status": "UNKNOWN", "reason": "valkey-payload-length-mismatch"}
+        try:
+            payload = bytes.fromhex(encoded_payload.decode("ascii"))
+        except (UnicodeDecodeError, ValueError):
+            return {"status": "UNKNOWN", "reason": "valkey-payload-hex-decode-failed-or-invalid"}
+        if len(payload) != expected_payload_bytes:
+            return {"status": "UNKNOWN", "reason": "valkey-payload-length-mismatch"}
         phase = "protobuf-decode"
         cart = decode_valkey_cart(payload)
         phase = "payload-identity"
