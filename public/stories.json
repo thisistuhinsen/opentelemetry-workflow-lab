@@ -30,12 +30,21 @@
     },
     "mcp-session-id": {
       "title": "MCP reads the right cart",
-      "description": "Add an item through HTTP, then verify the corrected MCP tool reads the same shopper cart.",
+      "description": "Seed distinct carts for two synthetic shoppers, then verify MCP and HTTP reads stay aligned by shopper.",
       "action": "mcp-cart",
       "source_variant": "mcp-session-id",
       "cartFailure": "off",
       "paymentUnreachable": "off",
       "expected": "matching-cart"
+    },
+    "shared-cart-conflict": {
+      "title": "Ordered conflicting cart intents",
+      "description": "Run two separate sequential clients against one synthetic cart: actor A adds an item, then actor B clears it; retain both raw responses and the final readback.",
+      "action": "shared-cart",
+      "source_variant": "original",
+      "cartFailure": "off",
+      "paymentUnreachable": "off",
+      "expected": "ordered-conflict"
     }
   }
 }

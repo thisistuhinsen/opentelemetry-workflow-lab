@@ -225,12 +225,24 @@ class ShopControls(unittest.TestCase):
 
         def http(port, method, path, body=None):
             calls.append((method, path, body))
-            return (204, None) if method == "DELETE" else (200, {"items": []})
+            return (204, None) if method == "DELETE" else (200, {"userId": user, "items": []})
 
         result = shop.reset_subject({"users": {user: {"status": "OBSERVED"}}, "http_port": 18080}, user, http)
         self.assertTrue(result["API_cart_readback_empty"])
         self.assertEqual(calls[0], ("DELETE", "/api/cart", {"userId": user}))
         self.assertEqual(calls[1][0], "GET")
+
+    def test_reset_rejects_wrong_shopper_readback(self):
+        shop = self.module()
+        user = "shop-11111111-1111-4111-8111-111111111111"
+
+        def http(port, method, path, body=None):
+            if method == "DELETE":
+                return 204, None
+            return 200, {"userId": "shop-22222222-2222-4222-8222-222222222222", "items": []}
+
+        with self.assertRaises(RuntimeError):
+            shop.reset_subject({"users": {user: {"status": "OBSERVED"}}, "http_port": 18080}, user, http)
 
     def test_unknown_checkout_cannot_be_reset(self):
         shop = self.module()
@@ -437,7 +449,7 @@ class ShopControls(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertIn("info", calls[0])
 
-    def state_fixture(self, shop, root):
+    def state_fixture(self, shop, root, *, story="normal-checkout"):
         images = dict(shop.BASE_IMAGES)
         lock = root / "images.json"
         shop.write_json(
@@ -490,7 +502,7 @@ class ShopControls(unittest.TestCase):
             "http_port": 18080,
             "mcp_port": 18011,
             "started": True,
-            "story": "normal-checkout",
+            "story": story,
             "users": {},
             "source_variant": "original",
             "workspace": str(workspace),
@@ -526,15 +538,29 @@ class ShopControls(unittest.TestCase):
             if "config" in args and "--format" in args:
                 return json.dumps(rendered)
             if "exec" in args:
+                if source and 'call_tool("get_cart"' in source:
+                    users = json.loads(source.split("users = ", 1)[1].splitlines()[0])
+                    return json.dumps(
+                        {
+                            "initialized": True,
+                            "tool_names": ["get_cart"],
+                            "carts": [
+                                {"user_id": user, "is_error": False, "items": carts.get(user, [])}
+                                for user in users
+                            ],
+                        }
+                    )
                 return json.dumps({"ready": True})
             return ""
 
         def http(port, method, path, body=None):
             http_calls.append((method, path, body))
             if method == "GET" and path.startswith("/api/products"):
-                return 200, [{"id": "demo-product"}]
+                return 200, [{"id": "demo-product"}, {"id": "other-product"}]
             if method == "POST" and path.startswith("/api/cart"):
-                carts[body["userId"]] = [{"productId": "demo-product", "quantity": 1}]
+                carts[body["userId"]] = [
+                    {"productId": body["item"]["productId"], "quantity": body["item"]["quantity"]}
+                ]
                 return 200, {}
             if method == "POST" and path.startswith("/api/checkout"):
                 carts[body["userId"]] = []
@@ -544,7 +570,7 @@ class ShopControls(unittest.TestCase):
                 return 204, None
             if method == "GET" and path.startswith("/api/cart"):
                 user = path.split("sessionId=")[1].split("&")[0]
-                return 200, {"items": carts.get(user, [])}
+                return 200, {"userId": user, "items": carts.get(user, [])}
             raise AssertionError((method, path))
 
         return runner, http, native_calls, http_calls
@@ -574,6 +600,192 @@ class ShopControls(unittest.TestCase):
                 self.assertNotIn(private, saved)
                 self.assertNotIn(private, output.getvalue())
             self.assertTrue(all(args[:3] == ["docker", "--context", "captured-engine"] for args in natives))
+
+    def test_mcp_story_verifies_two_distinct_synthetic_shopper_carts(self):
+        shop = ShopControls().module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.state_fixture(shop, root, story="mcp-session-id")
+            runner, http, _, _ = self.adapters(shop)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(shop.main(["--state-dir", str(root), "story"], runner, http), 0)
+            final_state = json.loads((shop.active_directory(root) / "state.json").read_bytes())
+            result = json.loads(
+                (shop.active_directory(root) / ("result-" + final_state["last_user"] + ".json")).read_bytes()
+            )
+            self.assertTrue(result["assessment"]["passed"])
+            self.assertTrue(result["actor_isolation_verified"])
+            self.assertEqual(len(result["HTTP_carts_by_synthetic_actor"]), 2)
+            self.assertEqual(result["HTTP_carts_by_synthetic_actor"], result["MCP_carts_by_synthetic_actor"])
+            self.assertNotEqual(*result["HTTP_carts_by_synthetic_actor"].values())
+
+    def test_shared_cart_conflict_uses_separate_ordered_clients_and_keeps_raw_responses(self):
+        shop = ShopControls().module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = self.state_fixture(shop, root, story="shared-cart-conflict")
+            carts = {}
+            clients = []
+
+            def http(port, method, path, body=None):
+                if method == "GET" and path.startswith("/api/products"):
+                    return 200, [{"id": "demo-product"}, {"id": "other-product"}]
+                if method == "GET" and path.startswith("/api/cart"):
+                    user = path.split("sessionId=")[1].split("&")[0]
+                    return 200, {"userId": user, "items": carts.get(user, [])}
+                raise AssertionError((method, path))
+
+            def runner(args, source=None):
+                if "node" not in args:
+                    return ""
+                script = args[-1]
+                user = json.loads(script.split("const userId = ", 1)[1].split(";", 1)[0])
+                actor = "actor-A" if "actor-A" in script else "actor-B"
+                clients.append((actor, user))
+                if actor == "actor-A":
+                    product = json.loads(script.split("const productId = ", 1)[1].split(";", 1)[0])
+                    carts[user] = [{"productId": product, "quantity": 1}]
+                    raw = json.dumps({"userId": user, "items": carts[user]})
+                    return json.dumps(
+                        {
+                            "actor_label": actor,
+                            "intent": "retain-added-item",
+                            "status": 200,
+                            "raw_response": raw,
+                            "raw_response_sha256": hashlib.sha256(raw.encode()).hexdigest(),
+                        }
+                    )
+                carts[user] = []
+                delete_raw = ""
+                read_raw = json.dumps({"userId": user, "items": carts[user]})
+                return json.dumps(
+                    {
+                        "actor_label": actor,
+                        "intent": "clear-shared-cart",
+                        "delete": {
+                            "status": 204,
+                            "raw_response": delete_raw,
+                            "raw_response_sha256": hashlib.sha256(delete_raw.encode()).hexdigest(),
+                        },
+                        "read": {
+                            "status": 200,
+                            "raw_response": read_raw,
+                            "raw_response_sha256": hashlib.sha256(read_raw.encode()).hexdigest(),
+                        },
+                    }
+                )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                outcome = shop.run_story(
+                    state,
+                    root,
+                    "shop-11111111-1111-4111-8111-111111111111",
+                    http=http,
+                    runner=runner,
+                )
+            self.assertEqual([actor for actor, _ in clients], ["actor-A", "actor-B"])
+            self.assertEqual(clients[0][1], clients[1][1])
+            self.assertEqual(outcome["assessment"]["passed"], True)
+            self.assertEqual(outcome["actor_intents"][0]["sequence"], 1)
+            self.assertEqual(outcome["actor_intents"][1]["sequence"], 2)
+            self.assertEqual(outcome["ordered_client_results"][1]["cart_after"], [])
+            self.assertEqual(outcome["host_cart_after"], [])
+            self.assertEqual(
+                hashlib.sha256(outcome["ordered_client_results"][0]["raw_response"].encode()).hexdigest(),
+                outcome["ordered_client_results"][0]["raw_response_sha256"],
+            )
+
+    def test_shared_cart_client_failure_stays_unknown_and_cannot_reset(self):
+        shop = ShopControls().module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = self.state_fixture(shop, root, story="shared-cart-conflict")
+            carts = {}
+
+            def http(port, method, path, body=None):
+                if method == "GET" and path.startswith("/api/products"):
+                    return 200, [{"id": "demo-product"}, {"id": "other-product"}]
+                if method == "GET" and path.startswith("/api/cart"):
+                    shared_user = path.split("sessionId=")[1].split("&")[0]
+                    return 200, {"userId": shared_user, "items": carts.get(shared_user, [])}
+                raise AssertionError((method, path))
+
+            def fail_second_client(args, source=None):
+                if "node" not in args:
+                    return ""
+                script = args[-1]
+                user = json.loads(script.split("const userId = ", 1)[1].split(";", 1)[0])
+                if "actor-A" in script:
+                    product = json.loads(script.split("const productId = ", 1)[1].split(";", 1)[0])
+                    carts[user] = [{"productId": product, "quantity": 1}]
+                    raw = json.dumps({"userId": user, "items": carts[user]})
+                    return json.dumps(
+                        {
+                            "actor_label": "actor-A",
+                            "intent": "retain-added-item",
+                            "status": 200,
+                            "raw_response": raw,
+                            "raw_response_sha256": hashlib.sha256(raw.encode()).hexdigest(),
+                        }
+                    )
+                raise RuntimeError("synthetic second-client disconnect after the first write")
+
+            user = "shop-11111111-1111-4111-8111-111111111111"
+            with self.assertRaises(RuntimeError):
+                shop.run_story(state, root, user, http=http, runner=fail_second_client)
+            failed = json.loads((root / "state.json").read_bytes())
+            self.assertEqual(failed["users"][user]["status"], "UNKNOWN_AFTER_DISPATCH")
+            with self.assertRaises(ValueError):
+                shop.reset_subject(
+                    failed, user, lambda *args: self.fail("Unknown shared state cannot reset.")
+                )
+
+    def test_incomplete_mcp_actor_comparison_stays_unknown_and_cannot_reset(self):
+        for failure in ("runner", "malformed", "missing", "extra", "wrong"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                shop = ShopControls().module()
+                root = Path(directory)
+                state = self.state_fixture(shop, root, story="mcp-session-id")
+                runner, http, _, _ = self.adapters(shop)
+
+                def incomplete_runner(args, source=None):
+                    if "exec" not in args or not (source and 'call_tool("get_cart"' in source):
+                        return runner(args, source)
+                    if failure == "runner":
+                        raise RuntimeError("synthetic MCP transport failure")
+                    if failure == "malformed":
+                        return "not-json"
+                    result = json.loads(runner(args, source))
+                    if failure == "missing":
+                        result["carts"].pop()
+                    elif failure == "extra":
+                        result["carts"].append(dict(result["carts"][0]))
+                    elif failure == "wrong":
+                        result["carts"][1]["user_id"] = "shop-00000000-0000-4000-8000-000000000000"
+                    return json.dumps(result)
+
+                with self.assertRaises((RuntimeError, ValueError)):
+                    shop.run_story(
+                        state,
+                        root,
+                        "shop-11111111-1111-4111-8111-111111111111",
+                        http=http,
+                        runner=incomplete_runner,
+                    )
+                failed_state = json.loads((root / "state.json").read_bytes())
+                actors = failed_state["users"]
+                self.assertEqual(len(actors), 2)
+                self.assertTrue(all(value["status"] == "UNKNOWN_AFTER_DISPATCH" for value in actors.values()))
+                calls_before_reset = []
+
+                def no_reset(*args):
+                    calls_before_reset.append(args)
+                    raise AssertionError("An unknown MCP comparison must not dispatch reset.")
+
+                for actor in actors:
+                    with self.assertRaises(ValueError):
+                        shop.reset_subject(failed_state, actor, no_reset)
+                self.assertEqual(calls_before_reset, [])
 
     def test_public_replay_preserves_old_claim_and_uses_fresh_world_and_shopper(self):
         shop = self.module()
@@ -689,6 +901,39 @@ class StoryOutcomeControls(unittest.TestCase):
             "cart_after": [],
         }
         self.assertFalse(shop.assess_story("normal-checkout", outcome)["passed"])
+
+    def test_unavailable_or_wrong_shopper_readback_stays_unknown_and_cannot_reset(self):
+        for mode in ("unavailable", "wrong-shopper"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                controls = ShopControls()
+                shop = controls.module()
+                root = Path(temporary)
+                controls.state_fixture(shop, root)
+                runner, http, _, requests = controls.adapters(shop)
+                checkout_dispatched = False
+
+                def degraded_readback(port, method, path, body=None):
+                    nonlocal checkout_dispatched
+                    if checkout_dispatched and method == "GET" and path.startswith("/api/cart"):
+                        if mode == "unavailable":
+                            return 503, {}
+                        return 200, {"userId": "shop-22222222-2222-4222-8222-222222222222", "items": []}
+                    result = http(port, method, path, body)
+                    if method == "POST" and path.startswith("/api/checkout"):
+                        checkout_dispatched = True
+                    return result
+
+                with self.assertRaises(ValueError):
+                    shop.main(["--state-dir", str(root), "story"], runner, degraded_readback)
+                state = json.loads((root / "state.json").read_bytes())
+                user = state["last_user"]
+                self.assertEqual(state["users"][user]["status"], "UNKNOWN_AFTER_DISPATCH")
+                self.assertEqual(
+                    len([row for row in requests if row[0] == "POST" and row[1].startswith("/api/checkout")]),
+                    1,
+                )
+                with self.assertRaises(ValueError):
+                    shop.reset_subject(state, user, lambda *args: self.fail("Unknown readback cannot reset."))
 
     def test_green_retained_cart_fails_normal_but_demonstrates_selected_fault(self):
         shop = ShopControls().module()

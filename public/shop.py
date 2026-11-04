@@ -50,7 +50,7 @@ PROFILE = json.loads((PUBLIC / "runtime-profile.json").read_bytes())
 for _name, _story in STORIES.items():
     if (
         not re.fullmatch(r"[a-z][a-z0-9-]*", _name)
-        or _story.get("action") not in ("checkout", "mcp-cart")
+        or _story.get("action") not in ("checkout", "mcp-cart", "shared-cart")
         or _story.get("source_variant") not in ("original", "mcp-session-id")
     ):
         raise ValueError("Story catalog contains an unsupported name, action or source variant.")
@@ -124,7 +124,28 @@ def assess_story(story, outcome):
             and outcome.get("MCP_initialized") is True
             and outcome.get("tool_error") is False
             and outcome.get("projections_match") is True
+            and outcome.get("actor_isolation_verified") is True
             and after == before
+        )
+    elif expected == "ordered-conflict":
+        intents = outcome.get("actor_intents", [])
+        client_results = outcome.get("ordered_client_results", [])
+        passed = (
+            before == []
+            and len(intents) == 2
+            and [row.get("sequence") for row in intents] == [1, 2]
+            and [row.get("intent") for row in intents] == ["retain-added-item", "clear-shared-cart"]
+            and intents[0].get("shared_user_id") == intents[1].get("shared_user_id")
+            and len(client_results) == 2
+            and [row.get("actor_label") for row in client_results] == ["actor-A", "actor-B"]
+            and outcome.get("host_cart_after") == []
+            and client_results[0].get("cart_after") == before + [client_results[0].get("added_item")]
+            and client_results[1].get("delete_status") == 204
+            and client_results[1].get("cart_after") == []
+            and outcome.get("cart_HTTP_status") == 200
+            and after == []
+            and outcome.get("actor_identity") == "HARNESS_LABELS_ONLY_NOT_APPLICATION_AUTHENTICATION"
+            and outcome.get("concurrency_claim") == "SEQUENTIALLY_ORDERED_NOT_OVERLAP_TESTED"
         )
     else:
         raise ValueError("Story expected outcome is unsupported.")
@@ -659,7 +680,12 @@ def reset_subject(state, user, http=request):
     if status not in (200, 204):
         raise RuntimeError("Exact shopper cart reset failed; no retry was made.")
     read_status, cart = http(state["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD")
-    if read_status != 200 or not isinstance(cart, dict) or cart.get("items") != []:
+    if (
+        read_status != 200
+        or not isinstance(cart, dict)
+        or cart.get("userId") != user
+        or cart.get("items") != []
+    ):
         raise RuntimeError("Reset acknowledgement did not produce an API empty-cart readback; no retry.")
     return {
         "synthetic_cart_reset_status": status,
@@ -681,10 +707,12 @@ def claim_checkout(directory, user):
     return path
 
 
-def cart_items(value):
+def cart_items(value, *, expected_user=None):
     result = []
     if not isinstance(value, dict) or not isinstance(value.get("items"), list):
         raise ValueError("Cart read has no valid items array; empty-cart observation is unknown.")
+    if expected_user is not None and value.get("userId") != expected_user:
+        raise ValueError("Cart read is for another or unknown synthetic shopper; observation is unknown.")
     for item in value["items"]:
         if not isinstance(item, dict):
             raise ValueError("Cart item schema is invalid; cart observation is unknown.")
@@ -752,6 +780,118 @@ def wait_ready(state, runner=native, http=request, *, seconds=60, pause=time.sle
             pause(2)
 
 
+def run_shared_cart_conflict(state, directory, user, product, runner, http):
+    """Run two separate sequential clients against one synthetic user/cart."""
+    initial_status, initial = http(
+        state["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD"
+    )
+    if initial_status != 200 or cart_items(initial, expected_user=user):
+        raise ValueError("Shared-cart conflict requires a verified empty prestate; no actor ran.")
+    second_product = product[1]
+    if product[0] == second_product:
+        raise ValueError("The catalogue did not provide distinct products for the conflict case.")
+
+    actor_a_source = """const crypto = require('node:crypto');
+const userId = USER_ID;
+const productId = PRODUCT_ID;
+async function main() {
+  const response = await fetch('http://127.0.0.1:8080/api/cart?currencyCode=USD', {
+    method: 'POST', headers: {'content-type': 'application/json'},
+    body: JSON.stringify({userId, item: {productId, quantity: 1}})
+  });
+  const raw = await response.text();
+  process.stdout.write(JSON.stringify({actor_label: 'actor-A', intent: 'retain-added-item', status: response.status,
+    raw_response: raw, raw_response_sha256: crypto.createHash('sha256').update(raw).digest('hex')}) + '\\n');
+}
+main().catch(error => { console.error(String(error)); process.exitCode = 1; });
+""".replace("USER_ID", json.dumps(user)).replace("PRODUCT_ID", json.dumps(product[0]))
+    state["users"][user] = {"status": "DISPATCHED", "story": "shared-cart-conflict"}
+    write_json(directory / "state.json", state)
+    actor_a = json.loads(
+        runner(compose_args(state, ["exec", "-T", "frontend", "node", "-e", actor_a_source]))
+    )
+    if (
+        actor_a.get("status") != 200
+        or actor_a.get("actor_label") != "actor-A"
+        or actor_a.get("intent") != "retain-added-item"
+        or hashlib.sha256(actor_a.get("raw_response", "").encode()).hexdigest()
+        != actor_a.get("raw_response_sha256")
+    ):
+        raise RuntimeError("First shared-cart client result is missing or unbound; state is unknown.")
+    actor_a_cart = json.loads(actor_a["raw_response"])
+    added_items = cart_items(actor_a_cart, expected_user=user)
+    expected_item = {"product_id": product[0], "quantity": 1}
+    if added_items != [expected_item]:
+        raise RuntimeError("First client did not observe its expected cart write; state is unknown.")
+
+    actor_b_source = """const crypto = require('node:crypto');
+const userId = USER_ID;
+async function record(response) {
+  const raw = await response.text();
+  return {status: response.status, raw_response: raw,
+    raw_response_sha256: crypto.createHash('sha256').update(raw).digest('hex')};
+}
+async function main() {
+  const deleted = await record(await fetch('http://127.0.0.1:8080/api/cart', {
+    method: 'DELETE', headers: {'content-type': 'application/json'}, body: JSON.stringify({userId})
+  }));
+  const read = await record(await fetch('http://127.0.0.1:8080/api/cart?sessionId=' + encodeURIComponent(userId) + '&currencyCode=USD'));
+  process.stdout.write(JSON.stringify({actor_label: 'actor-B', intent: 'clear-shared-cart', delete: deleted, read}) + '\\n');
+}
+main().catch(error => { console.error(String(error)); process.exitCode = 1; });
+""".replace("USER_ID", json.dumps(user))
+    actor_b = json.loads(
+        runner(compose_args(state, ["exec", "-T", "frontend", "node", "-e", actor_b_source]))
+    )
+    if actor_b.get("actor_label") != "actor-B" or actor_b.get("intent") != "clear-shared-cart":
+        raise RuntimeError("Second shared-cart client identity is missing; state is unknown.")
+    for record in (actor_b.get("delete", {}), actor_b.get("read", {})):
+        if hashlib.sha256(record.get("raw_response", "").encode()).hexdigest() != record.get(
+            "raw_response_sha256"
+        ):
+            raise RuntimeError("Second shared-cart client result is missing or unbound; state is unknown.")
+    if actor_b.get("delete", {}).get("status") != 204 or actor_b.get("read", {}).get("status") != 200:
+        raise RuntimeError("Second shared-cart client did not clear and read the cart; state is unknown.")
+    actor_b_cart = json.loads(actor_b["read"]["raw_response"])
+    client_b_items = cart_items(actor_b_cart, expected_user=user)
+    observer_status, observer = http(
+        state["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD"
+    )
+    observed_items = cart_items(observer, expected_user=user) if observer_status == 200 else None
+    return {
+        "story": "shared-cart-conflict",
+        "cart_before": [],
+        "cart_after": client_b_items,
+        "cart_HTTP_status": observer_status,
+        "actor_intents": [
+            {"sequence": 1, "actor_label": "actor-A", "intent": "retain-added-item", "shared_user_id": user},
+            {"sequence": 2, "actor_label": "actor-B", "intent": "clear-shared-cart", "shared_user_id": user},
+        ],
+        "ordered_client_results": [
+            {
+                "actor_label": "actor-A",
+                "added_item": expected_item,
+                "cart_after": added_items,
+                "raw_response": actor_a["raw_response"],
+                "raw_response_sha256": actor_a["raw_response_sha256"],
+            },
+            {
+                "actor_label": "actor-B",
+                "delete_status": actor_b.get("delete", {}).get("status"),
+                "cart_after": client_b_items,
+                "delete_raw_response": actor_b["delete"]["raw_response"],
+                "delete_raw_response_sha256": actor_b["delete"]["raw_response_sha256"],
+                "read_raw_response": actor_b["read"]["raw_response"],
+                "read_raw_response_sha256": actor_b["read"]["raw_response_sha256"],
+            },
+        ],
+        "host_cart_after": observed_items,
+        "actor_identity": "HARNESS_LABELS_ONLY_NOT_APPLICATION_AUTHENTICATION",
+        "concurrency_claim": "SEQUENTIALLY_ORDERED_NOT_OVERLAP_TESTED",
+        "runtime_qualification": "OBSERVATION_ONLY_NO_PRODUCT_AUTH_OR_CONCURRENCY_CLAIM",
+    }
+
+
 def run_story(state, directory, user, fixture=None, http=request, runner=native):
     validate_user(user)
     if user in state["users"]:
@@ -759,7 +899,7 @@ def run_story(state, directory, user, fixture=None, http=request, runner=native)
             "Shopper was already used. Replay requires a new synthetic ID, never a checkout retry."
         )
     story = state["story"]
-    if STORIES[story]["action"] != "mcp-cart":
+    if STORIES[story]["action"] == "checkout":
         person = synthetic_fixture() if fixture is None else json.loads(fixture.read_bytes())
         if _RECORDER is not None:
             _RECORDER.set_redactions(
@@ -776,6 +916,34 @@ def run_story(state, directory, user, fixture=None, http=request, runner=native)
     if status != 200 or not isinstance(products, list) or not products:
         raise RuntimeError("Catalogue read failed; no fixture was added.")
     product = products[0]["id"]
+    if STORIES[story]["action"] == "shared-cart":
+        try:
+            if len(products) < 2:
+                raise ValueError("The catalogue did not provide two products for the shared-cart conflict.")
+            outcome = run_shared_cart_conflict(
+                state, directory, user, [products[0]["id"], products[1]["id"]], runner, http
+            )
+        except Exception:
+            status = state["users"][user].get("status")
+            state["users"][user] = {
+                "status": "UNKNOWN_AFTER_DISPATCH" if status == "DISPATCHED" else "NOT_RUN",
+                "story": story,
+            }
+            write_json(directory / "state.json", state)
+            raise
+        outcome["assessment"] = assess_story(story, outcome)
+        state["users"][user] = {
+            "status": "OBSERVED" if outcome["assessment"]["passed"] else "UNKNOWN_AFTER_DISPATCH",
+            "story": story,
+        }
+        write_json(directory / "state.json", state)
+        write_json(directory / ("result-" + user + ".json"), outcome)
+        if _RECORDER is not None:
+            _RECORDER.result(outcome)
+        if not outcome["assessment"]["passed"]:
+            raise RuntimeError("The shared-cart ordering result did not match its expected behavior.")
+        progress("Case complete: " + STORIES[story]["title"] + " behaved as described.")
+        return outcome
     state["users"][user] = {"status": "SEED_DISPATCHED"}
     write_json(directory / "state.json", state)
     status, _ = http(
@@ -791,35 +959,95 @@ def run_story(state, directory, user, fixture=None, http=request, runner=native)
     )
     if before_status != 200:
         raise RuntimeError("Cart prestate read failed; no checkout was dispatched.")
+    other_user = None
     if STORIES[story]["action"] == "mcp-cart":
-        source = """import asyncio,json
+        other_user = "shop-" + str(uuid.uuid4())
+        validate_user(other_user)
+        state["users"][other_user] = {"status": "STARTED", "story": story}
+        write_json(directory / "state.json", state)
+        try:
+            if len(products) < 2 or products[0].get("id") == products[1].get("id"):
+                raise ValueError(
+                    "The public catalogue does not provide two distinct products for the isolation check."
+                )
+            other_status, _ = http(
+                state["http_port"],
+                "POST",
+                "/api/cart?currencyCode=USD",
+                {"userId": other_user, "item": {"productId": products[1]["id"], "quantity": 1}},
+            )
+            if other_status != 200:
+                raise RuntimeError("Second synthetic cart seeding failed; no retry was made.")
+            primary_status, primary = http(
+                state["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD"
+            )
+            other_read_status, other = http(
+                state["http_port"], "GET", "/api/cart?sessionId=" + other_user + "&currencyCode=USD"
+            )
+            if primary_status != 200 or other_read_status != 200:
+                raise RuntimeError("A synthetic actor's cart readback failed; MCP comparison is unknown.")
+            primary_items = cart_items(primary, expected_user=user)
+            other_items = cart_items(other, expected_user=other_user)
+            source = """import asyncio,json
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
+users = USER_IDS
 async def main():
  async with streamablehttp_client("http://127.0.0.1:8011/mcp") as (read,write,_):
   async with ClientSession(read,write) as session:
    await session.initialize()
    tools=await session.list_tools()
-   result=await session.call_tool("get_cart",{"user_id":USER})
-   items=[]
-   for content in result.content:
-    if hasattr(content,"text"):
-     try: items=json.loads(content.text).get("items",[])
-     except (ValueError,AttributeError): pass
-   print(json.dumps({"initialized":True,"tool_names":[x.name for x in tools.tools],"is_error":result.isError,"items":[{"product_id":x.get("productId",x.get("product_id")),"quantity":x.get("quantity")} for x in items]}))
+   carts=[]
+   for user in users:
+    result=await session.call_tool("get_cart",{"user_id":user})
+    items=[]
+    for content in result.content:
+     if hasattr(content,"text"):
+      try: items=json.loads(content.text).get("items",[])
+      except (ValueError,AttributeError): pass
+    carts.append({"user_id":user,"is_error":result.isError,"items":[{"product_id":x.get("productId",x.get("product_id")),"quantity":x.get("quantity")} for x in items]})
+   print(json.dumps({"initialized":True,"tool_names":[x.name for x in tools.tools],"carts":carts}))
 asyncio.run(main())
-""".replace("USER", json.dumps(user))
-        result = json.loads(runner(compose_args(state, ["exec", "-T", "mcp", "python", "-"]), source))
-        outcome = {
-            "story": story,
-            "cart_HTTP_status": before_status,
-            "MCP_initialized": result["initialized"],
-            "tool_error": result["is_error"],
-            "HTTP_cart": cart_items(before),
-            "MCP_cart": result["items"],
-            "projections_match": cart_items(before) == result["items"],
-            "runtime_qualification": "OBSERVATION_ONLY_NOT_INDEPENDENT_EFFECT_PROOF",
-        }
+""".replace("USER_IDS", json.dumps([user, other_user]))
+            result = json.loads(runner(compose_args(state, ["exec", "-T", "mcp", "python", "-"]), source))
+            if len(result.get("carts", [])) != 2 or [entry.get("user_id") for entry in result["carts"]] != [
+                user,
+                other_user,
+            ]:
+                raise RuntimeError("MCP cart reads did not return both requested synthetic actors in order.")
+            mcp_carts = {
+                entry["user_id"]: entry["items"]
+                for entry in result["carts"]
+                if entry.get("is_error") is False
+            }
+            http_carts = {user: primary_items, other_user: other_items}
+            normalized_mcp = {actor: cart_items({"items": items}) for actor, items in mcp_carts.items()}
+            projections_match = normalized_mcp == http_carts and len(normalized_mcp) == 2
+            actor_isolation_verified = (
+                user != other_user
+                and bool(primary_items)
+                and bool(other_items)
+                and primary_items != other_items
+                and projections_match
+            )
+            outcome = {
+                "story": story,
+                "cart_HTTP_status": min(before_status, primary_status, other_status, other_read_status),
+                "MCP_initialized": result["initialized"],
+                "tool_error": len(mcp_carts) != 2,
+                "HTTP_cart": primary_items,
+                "MCP_cart": normalized_mcp.get(user, []),
+                "HTTP_carts_by_synthetic_actor": http_carts,
+                "MCP_carts_by_synthetic_actor": normalized_mcp,
+                "actor_isolation_verified": actor_isolation_verified,
+                "projections_match": projections_match,
+                "runtime_qualification": "OBSERVATION_ONLY_NOT_INDEPENDENT_EFFECT_PROOF",
+            }
+        except Exception:
+            for actor in (user, other_user):
+                state["users"][actor] = {"status": "UNKNOWN_AFTER_DISPATCH", "story": story}
+            write_json(directory / "state.json", state)
+            raise
     else:
         claim_checkout(directory / "checkout-claims", user)
         state["users"][user] = {"status": "UNKNOWN_AFTER_DISPATCH"}
@@ -844,13 +1072,20 @@ asyncio.run(main())
             "checkout_HTTP_status": status,
             "order_response_present": isinstance(response, dict) and bool(response.get("orderId")),
             "cart_HTTP_status": after_status,
-            "cart_before": cart_items(before),
-            "cart_after": cart_items(after),
+            "cart_before": cart_items(before, expected_user=user),
+            "cart_after": cart_items(after, expected_user=user),
             "runtime_qualification": "OBSERVATION_ONLY_NO_SETTLEMENT_OR_RETRY_SAFETY_CLAIM",
         }
     outcome["assessment"] = assess_story(story, outcome)
-    settled = STORIES[story]["action"] == "mcp-cart" or (status == 200 and after_status == 200)
+    settled = (STORIES[story]["action"] == "mcp-cart" and outcome["assessment"]["passed"]) or (
+        STORIES[story]["action"] != "mcp-cart" and status == 200 and after_status == 200
+    )
     state["users"][user] = {"status": "OBSERVED" if settled else "UNKNOWN_AFTER_DISPATCH", "story": story}
+    if other_user is not None:
+        state["users"][other_user] = {
+            "status": "OBSERVED" if settled else "UNKNOWN_AFTER_DISPATCH",
+            "story": story,
+        }
     write_json(directory / "state.json", state)
     write_json(directory / ("result-" + user + ".json"), outcome)
     if _RECORDER is not None:

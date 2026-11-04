@@ -33,9 +33,12 @@ shop.cmd clean
 | normal | Add one item, then check out | Order response and empty cart |
 | cart-failure | Enable the demo cart-clear fault, then check out | Order response but the item remains; this demonstrates the fault |
 | payment-unreachable | Enable the demo payment-unavailable flag | Exactly one checkout request, an error response without an order, and an independently read retained cart; CI also joins the synthetic shopper to a positive checkout error span |
-| mcp-session-id | Read one shopper's cart through HTTP and MCP | Matching item identity and quantity |
+| mcp-session-id | Seed distinct carts for two synthetic shoppers and read both through HTTP and MCP | Both projections match per shopper and remain distinct |
+| shared-cart-conflict | Launch two sequential clients with harness-only actor labels against one synthetic cart; actor A adds an item, actor B clears it | Ordered raw responses and same-user readback show the later clear; this is not an overlap/concurrency or product-authentication test |
 
 A case passes when its stated observation is reproduced. A harmful case passing does not mean its business behavior is correct. These observations do not establish settlement, fulfillment, durable deduplication or safe retry. A failed or ambiguous attempt remains recorded.
+
+Cart observations are bound to the requested synthetic `userId`; unavailable, malformed, or mismatched-user readbacks remain unknown and cannot be reset as settled. The harness also tests allowed operations on its captured Compose target and denial when target identity drifts. That is harness-scope enforcement, not application authorization. CI resets to a fresh isolated shop and replays each case with fresh identities; it compares stable semantic outcomes while excluding project, shopper, and time IDs.
 
 ## Evidence survives Docker cleanup
 

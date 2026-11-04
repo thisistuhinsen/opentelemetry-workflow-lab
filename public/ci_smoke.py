@@ -493,6 +493,70 @@ def assert_fresh(before, after, context, *, empty=False):
         raise RuntimeError("Replay reused a previous shopper.")
 
 
+def semantic_outcome(result):
+    """Keep stable behavior fields while excluding run, project, actor and time IDs."""
+    story = result.get("story")
+    assessment = result.get("assessment", {})
+    common = {
+        "story": story,
+        "assessment_passed": assessment.get("passed"),
+        "assessment_expected": assessment.get("expected"),
+    }
+    if story in ("normal-checkout", "cart-failure", "payment-unreachable"):
+        before, after = result.get("cart_before"), result.get("cart_after")
+        relation = "UNKNOWN"
+        if isinstance(before, list) and isinstance(after, list):
+            relation = "EMPTY" if not after else "UNCHANGED" if before == after else "CHANGED"
+        return {
+            **common,
+            "checkout_attempt_count": result.get("checkout_attempt_count"),
+            "checkout_status_class": _status_class(result.get("checkout_HTTP_status")),
+            "order_response_present": result.get("order_response_present"),
+            "cart_status_class": _status_class(result.get("cart_HTTP_status")),
+            "cart_relation": relation,
+            "cart_before": before,
+            "cart_after": after,
+        }
+    if story == "mcp-session-id":
+        return {
+            **common,
+            "http_cart_contents": sorted(
+                json.dumps(cart, sort_keys=True)
+                for cart in result.get("HTTP_carts_by_synthetic_actor", {}).values()
+            ),
+            "mcp_cart_contents": sorted(
+                json.dumps(cart, sort_keys=True)
+                for cart in result.get("MCP_carts_by_synthetic_actor", {}).values()
+            ),
+            "actor_isolation_verified": result.get("actor_isolation_verified"),
+            "projections_match": result.get("projections_match"),
+            "tool_error": result.get("tool_error"),
+        }
+    if story == "shared-cart-conflict":
+        actors = result.get("ordered_client_results", [])
+        return {
+            **common,
+            "intents": [row.get("intent") for row in result.get("actor_intents", [])],
+            "actor_cart_contents": [row.get("cart_after") for row in actors],
+            "delete_status": actors[1].get("delete_status") if len(actors) == 2 else None,
+            "final_cart_contents": result.get("cart_after"),
+            "host_cart_contents": result.get("host_cart_after"),
+        }
+    raise ValueError("No stable semantic comparison is defined for this story.")
+
+
+def _status_class(value):
+    if type(value) is not int:
+        return "UNKNOWN"
+    if 200 <= value <= 299:
+        return "SUCCESS"
+    if 400 <= value <= 499:
+        return "CLIENT_ERROR"
+    if 500 <= value <= 599:
+        return "SERVER_ERROR"
+    return "OTHER"
+
+
 class Campaign:
     def __init__(self, state, evidence):
         self.state = state.resolve()
@@ -568,6 +632,7 @@ class Campaign:
             "project_id": result.get("project_id"),
             "synthetic_shopper_id": result.get("synthetic_shopper_id"),
             "checkout_attempt_count": result.get("checkout_attempt_count"),
+            "semantic_outcome": semantic_outcome(result),
         }
 
     def cleanup(self):
@@ -649,9 +714,72 @@ def self_test():
                 {"command": command, "status": "passed", "finished_at": timestamp(), "commands": []},
             )
             write_json(
-                directory / "result.json", {"story": "normal-checkout", "assessment": {"passed": passed}}
+                directory / "result.json",
+                {
+                    "story": "normal-checkout",
+                    "assessment": {"passed": passed, "expected": "success-empty"},
+                    "checkout_attempt_count": 1,
+                    "checkout_HTTP_status": 200,
+                    "order_response_present": True,
+                    "cart_HTTP_status": 200,
+                    "cart_before": [{"product_id": "demo-product", "quantity": 1}],
+                    "cart_after": [],
+                },
             )
             return directory
+
+        def test_semantic_repeatability_ignores_fresh_ids_but_detects_behavior_change(self):
+            first = {
+                "story": "normal-checkout",
+                "project_id": "shop-aaaaaaaaaaaa",
+                "synthetic_shopper_id": "shop-11111111-1111-4111-8111-111111111111",
+                "started_utc": "first-time",
+                "checkout_attempt_count": 1,
+                "checkout_HTTP_status": 200,
+                "order_response_present": True,
+                "cart_HTTP_status": 200,
+                "cart_before": [{"product_id": "demo-product", "quantity": 1}],
+                "cart_after": [],
+                "assessment": {"passed": True, "expected": "success-empty"},
+            }
+            replay = {
+                **first,
+                "project_id": "shop-bbbbbbbbbbbb",
+                "synthetic_shopper_id": "shop-22222222-2222-4222-8222-222222222222",
+                "started_utc": "second-time",
+            }
+            self.assertEqual(semantic_outcome(first), semantic_outcome(replay))
+            replay["cart_after"] = [{"product_id": "demo-product", "quantity": 1}]
+            self.assertNotEqual(semantic_outcome(first), semantic_outcome(replay))
+
+        def test_semantic_mcp_repeatability_ignores_actor_ids_not_cart_mismatch(self):
+            first = {
+                "story": "mcp-session-id",
+                "HTTP_carts_by_synthetic_actor": {
+                    "actor-one": [{"product_id": "item-a", "quantity": 1}],
+                    "actor-two": [{"product_id": "item-b", "quantity": 1}],
+                },
+                "MCP_carts_by_synthetic_actor": {
+                    "actor-one": [{"product_id": "item-a", "quantity": 1}],
+                    "actor-two": [{"product_id": "item-b", "quantity": 1}],
+                },
+                "actor_isolation_verified": True,
+                "projections_match": True,
+                "tool_error": False,
+                "assessment": {"passed": True, "expected": "matching-cart"},
+            }
+            replay = json.loads(json.dumps(first))
+            replay["HTTP_carts_by_synthetic_actor"] = {
+                "fresh-one": [{"product_id": "item-b", "quantity": 1}],
+                "fresh-two": [{"product_id": "item-a", "quantity": 1}],
+            }
+            replay["MCP_carts_by_synthetic_actor"] = {
+                "fresh-one": [{"product_id": "item-b", "quantity": 1}],
+                "fresh-two": [{"product_id": "item-a", "quantity": 1}],
+            }
+            self.assertEqual(semantic_outcome(first), semantic_outcome(replay))
+            replay["MCP_carts_by_synthetic_actor"]["fresh-two"] = []
+            self.assertNotEqual(semantic_outcome(first), semantic_outcome(replay))
 
         def test_companion_coexists_with_one_matching_primary(self):
             def cli(*args):
@@ -1085,12 +1213,16 @@ def main(argv=None):
         campaign.cli("setup", "--context", context)
         campaign.cli("start", next(iter(catalog)))
         for story in catalog:
-            summary["story_results"].append(campaign.action(["story", story], story))
+            first = campaign.action(["story", story], story)
+            summary["story_results"].append(first)
             previous = active_state(campaign.state)
             campaign.cli("reset")
             reset = active_state(campaign.state)
             assert_fresh(previous, reset, context, empty=True)
-            summary["story_results"].append(campaign.action(["replay"], story))
+            replay_result = campaign.action(["replay"], story)
+            summary["story_results"].append(replay_result)
+            if first["semantic_outcome"] != replay_result["semantic_outcome"]:
+                raise RuntimeError("Reset/replay changed stable story semantics across fresh identities.")
             replay = active_state(campaign.state)
             assert_fresh(reset, replay, context)
             if set(previous.get("users", {})) & set(replay.get("users", {})):
