@@ -3,6 +3,7 @@ name: Source and Docker checks
 on:
   push:
     branches: [main, codex/cross-platform-watcher-20261103]
+    paths-ignore: ['.github/workflows/quality.yml']
   pull_request:
   workflow_dispatch:
 
@@ -15,6 +16,7 @@ concurrency:
 
 jobs:
   platform-contract:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.ref != 'refs/heads/codex/cross-platform-watcher-20261103' }}
     name: Process lifecycle contract (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
@@ -68,6 +70,18 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Verify isolated GitHub-hosted local Docker engine
+        run: |
+          test "${RUNNER_ENVIRONMENT:-}" = github-hosted
+          test "${RUNNER_OS:-}" = Linux
+          context="$(docker context show)"
+          endpoint="$(docker context inspect "$context" --format '{{.Endpoints.docker.Host}}')"
+          engine_os="$(docker --context "$context" info --format '{{.OSType}}')"
+          printf 'runner_environment=%s\nrunner_os=%s\ndocker_context=%s\ndocker_endpoint=%s\ndocker_engine_os=%s\n' \
+            "$RUNNER_ENVIRONMENT" "$RUNNER_OS" "$context" "$endpoint" "$engine_os"
+          test "$context" = default
+          test "$endpoint" = unix:///var/run/docker.sock
+          test "$engine_os" = linux
       - name: Set up Python
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
         with:
