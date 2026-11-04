@@ -1,5 +1,6 @@
 """Inert command-boundary controls; never invokes Docker or an application."""
 
+import base64
 import contextlib
 import copy
 import hashlib
@@ -113,6 +114,76 @@ class ShopControls(unittest.TestCase):
         self.assertEqual(set(result["services"]["frontend-proxy"]["networks"]), {"default", "edge"})
         self.assertEqual(set(result["services"]["mcp"]["networks"]), {"default", "edge"})
         self.assertEqual(set(result["services"]["checkout"]["networks"]), {"default"})
+
+    def test_optional_agent_replay_is_internal_pinned_and_read_only(self):
+        shop = self.module()
+        services = {
+            name: {
+                "image": "public:tag",
+                "build": {"context": "/pinned/source"},
+                "volumes": [],
+                "ports": ["8010"],
+                "environment": {},
+                "depends_on": {"mcp": {"condition": "service_started"}},
+                "networks": ["default"],
+            }
+            for name in shop.CORE_SERVICES
+        }
+        services["agent"] = {
+            "image": "public-agent:tag",
+            "build": {"context": "/pinned/source"},
+            "volumes": [{"type": "bind", "source": "/pinned/fixtures", "target": "/app/fixtures"}],
+            "ports": ["8010"],
+            "environment": {
+                "AZURE_OPENAI_API_KEY": "must-not-survive",
+                "OPENAI_ORG_ID": "must-not-survive",
+                "OTEL_RESOURCE_ATTRIBUTES": "untrusted-value",
+                "APPLICATION_ENDPOINT": "https://outside.invalid",
+            },
+            "depends_on": {"mcp": {"condition": "service_started"}},
+            "networks": ["default"],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            overlay = Path(temporary) / "sitecustomize.py"
+            overlay.write_text("# replay guard\n", encoding="utf-8")
+            rendered = {
+                "services": services,
+                "networks": {"default": {}},
+                "volumes": {},
+            }
+            config = shop.scoped_config(
+                rendered,
+                dict(shop.BASE_IMAGES),
+                "shop-0123456789ab",
+                Path(temporary) / "flags",
+                18080,
+                18011,
+                agent_replay=True,
+                agent_overlay=overlay,
+            )
+        agent = config["services"]["agent"]
+        self.assertEqual(agent["environment"]["USE_VCR"], "true")
+        self.assertEqual(agent["environment"]["VCR_MATCH_THRESHOLD"], "1.0")
+        self.assertEqual(agent["environment"]["LLM_BASE_URL"], "http://127.0.0.1:9/v1")
+        self.assertEqual(agent["environment"]["API_KEY"], "sk-dummy")
+        self.assertNotIn("AZURE_OPENAI_API_KEY", agent["environment"])
+        self.assertNotIn("OPENAI_ORG_ID", agent["environment"])
+        self.assertEqual(agent["environment"]["FLAGD_HOST"], "flagd")
+        self.assertEqual(agent["environment"]["FLAGD_PORT"], "8013")
+        self.assertEqual(
+            agent["environment"]["OTEL_RESOURCE_ATTRIBUTES"],
+            "service.namespace=workflow-lab,service.criticality=low",
+        )
+        self.assertEqual(agent["ports"], [])
+        self.assertEqual(agent["networks"], {"agent-replay": None})
+        self.assertTrue(config["networks"]["agent-replay"]["internal"])
+        self.assertIn("agent-replay", config["services"]["mcp"]["networks"])
+        self.assertIn("agent-replay", config["services"]["otel-collector"]["networks"])
+        self.assertIn("agent-replay", config["services"]["flagd"]["networks"])
+        fixture = next(volume for volume in agent["volumes"] if volume.get("target") == "/app/fixtures")
+        guard = next(volume for volume in agent["volumes"] if volume.get("target") == "/app/sitecustomize.py")
+        self.assertTrue(fixture["read_only"])
+        self.assertTrue(guard["read_only"])
 
     def test_stop_is_exact_project_and_preserves_data(self):
         shop = self.module()
@@ -557,10 +628,14 @@ class ShopControls(unittest.TestCase):
             if "exec" in args:
                 if source and 'call_tool("get_cart"' in source:
                     users = json.loads(source.split("users = ", 1)[1].splitlines()[0])
+                    product = json.loads(source.split("product_id = ", 1)[1].splitlines()[0])
+                    carts[users[1]] = [{"product_id": product, "quantity": 1}]
                     return json.dumps(
                         {
                             "initialized": True,
-                            "tool_names": ["get_cart"],
+                            "tool_names": ["add_to_cart", "get_cart"],
+                            "mutation_is_error": False,
+                            "mutation_items": carts[users[1]],
                             "carts": [
                                 {"user_id": user, "is_error": False, "items": carts.get(user, [])}
                                 for user in users
@@ -790,11 +865,11 @@ class ShopControls(unittest.TestCase):
                     failed, user, lambda *args: self.fail("Unknown shared state cannot reset.")
                 )
 
-    def test_shared_cart_overlap_records_only_measured_client_window_overlap(self):
+    def test_shared_cart_overlap_is_reported_not_required(self):
         shop = ShopControls().module()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            state = self.state_fixture(shop, root, story="shared-cart-overlap")
+            state = self.state_fixture(shop, root, story="shared-cart-overlap-diagnostic")
             scripts = []
             calls = []
             cart_reads = 0
@@ -846,13 +921,16 @@ class ShopControls(unittest.TestCase):
             self.assertEqual(outcome["final_cart_observation"], "ONE_UPDATE_NOT_PRESENT")
             self.assertEqual(
                 outcome["concurrency_claim"],
-                "CLIENT_REQUEST_WINDOWS_OVERLAPPED_SERVER_HANDLER_OVERLAP_NOT_ESTABLISHED",
+                "CLIENT_WINDOWS_MEASURED_SERVER_HANDLER_OVERLAP_NOT_ESTABLISHED",
             )
             self.assertEqual(state["users"][user]["status"], "OBSERVED")
 
             nonoverlap = copy.deepcopy(outcome)
             nonoverlap["concurrent_client_results"][1]["request_start_monotonic_ns"] = 401
-            self.assertFalse(shop.assess_story("shared-cart-overlap", nonoverlap)["passed"])
+            assessment = shop.assess_story("shared-cart-overlap-diagnostic", nonoverlap)
+            self.assertTrue(assessment["passed"])
+            self.assertFalse(assessment["client_window_overlap_observed"])
+            self.assertEqual(assessment["service_handler_overlap_claim"], "NOT_ESTABLISHED")
 
     def test_incomplete_mcp_actor_comparison_stays_unknown_and_cannot_reset(self):
         for failure in ("runner", "malformed", "missing", "extra", "wrong"):
@@ -1058,6 +1136,120 @@ class StoryOutcomeControls(unittest.TestCase):
                 )
                 with self.assertRaises(ValueError):
                     shop.reset_subject(state, user, lambda *args: self.fail("Unknown readback cannot reset."))
+
+    def test_readonly_valkey_observer_binds_pinned_cart_and_fails_closed(self):
+        shop = ShopControls().module()
+        state = {
+            "project": "shop-0123456789ab",
+            "docker_context": "captured-engine",
+            "engine_id": "engine-test",
+            "config": str(PUBLIC / "collector.yaml"),
+            "source_variant": "original",
+            "source_commit": shop.SOURCE_COMMIT,
+        }
+        config_data = Path(state["config"]).read_bytes()
+        state["input_bindings"] = {
+            "compose": {"sha256": hashlib.sha256(config_data).hexdigest(), "bytes": len(config_data)},
+            "routing": shop.routing_binding(state),
+        }
+        user = "shop-11111111-1111-4111-8111-111111111111"
+
+        def varint(value):
+            encoded = bytearray()
+            while value > 0x7F:
+                encoded.append((value & 0x7F) | 0x80)
+                value >>= 7
+            encoded.append(value)
+            return bytes(encoded)
+
+        def field_bytes(number, payload):
+            return varint((number << 3) | 2) + varint(len(payload)) + payload
+
+        def cart_bytes(payload_user, items):
+            result = field_bytes(1, payload_user.encode()) if payload_user else b""
+            for product, quantity in items:
+                item = field_bytes(1, product.encode()) + varint((2 << 3) | 0) + varint(quantity)
+                result += field_bytes(2, item)
+            return result
+
+        raw = cart_bytes(user, [("demo-product", 2)])
+        encoded = base64.b64encode(raw).decode()
+        calls = []
+
+        def runner(args):
+            calls.append(args)
+            if "info" in args:
+                return "engine-test"
+            return "1\n" + encoded + "\n"
+
+        observed = shop.read_valkey_cart(state, user, runner)
+        self.assertEqual(observed["status"], "OBSERVED")
+        self.assertEqual(observed["items"], [{"product_id": "demo-product", "quantity": 2}])
+        self.assertEqual(observed["identity_basis"], "payload-user-id")
+        self.assertEqual(shop.compare_valkey_cart(user, observed["items"], observed), "MATCHED_API_READBACK")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--context", calls[0])
+        self.assertIn("captured-engine", calls[0])
+        self.assertIn("info", calls[0])
+        self.assertIn("valkey-cart", calls[1])
+        self.assertIn("HEXISTS", calls[1][-1])
+        self.assertIn("HGET", calls[1][-1])
+        self.assertNotIn("VALKEY-CLI --RAW SET ", calls[1][-1].upper())
+
+        stale = shop.read_valkey_cart(
+            state,
+            user,
+            lambda args: (
+                "engine-test"
+                if "info" in args
+                else "1\n"
+                + base64.b64encode(cart_bytes("shop-22222222-2222-4222-8222-222222222222", [])).decode()
+                + "\n"
+            ),
+        )
+        self.assertEqual(stale["status"], "UNKNOWN")
+        self.assertEqual(shop.compare_valkey_cart(user, [], stale), "UNKNOWN")
+
+        unbound = shop.read_valkey_cart(
+            state,
+            user,
+            lambda args: (
+                "engine-test"
+                if "info" in args
+                else "1\n" + base64.b64encode(cart_bytes("", [("demo-product", 1)])).decode() + "\n"
+            ),
+        )
+        self.assertEqual(unbound["status"], "UNKNOWN")
+
+        empty = shop.read_valkey_cart(state, user, lambda args: "engine-test" if "info" in args else "1\n\n")
+        self.assertEqual(empty["status"], "OBSERVED")
+        self.assertEqual(empty["identity_basis"], "exact-valkey-hash-key-empty-payload-has-no-user-id")
+        self.assertEqual(shop.compare_valkey_cart(user, [], empty), "MATCHED_API_READBACK")
+
+        for output in ("0\n\n", "not-a-count\n\n", "1\n%%%\n", "1\nAQ==\n"):
+            with self.subTest(output=output):
+                missing = shop.read_valkey_cart(
+                    state, user, lambda args: "engine-test" if "info" in args else output
+                )
+                self.assertEqual(missing["status"], "UNKNOWN")
+        unavailable = shop.read_valkey_cart(
+            state, user, lambda _args: (_ for _ in ()).throw(OSError("offline"))
+        )
+        self.assertEqual(unavailable["status"], "UNKNOWN")
+        contradicted = {**observed, "items": []}
+        self.assertEqual(shop.compare_valkey_cart(user, observed["items"], contradicted), "CONTRADICTED")
+        for drift in (
+            {**state, "source_commit": "other"},
+            {**state, "docker_context": ""},
+            {**state, "project": "unowned"},
+            {**state, "config": "/not/a/captured/compose.json"},
+            {**state, "config": None},
+        ):
+            with self.subTest(drift=drift):
+                calls.clear()
+                result = shop.read_valkey_cart(drift, user, runner)
+                self.assertEqual(result["status"], "UNKNOWN")
+                self.assertEqual(calls, [])
 
     def test_green_retained_cart_fails_normal_but_demonstrates_selected_fault(self):
         shop = ShopControls().module()

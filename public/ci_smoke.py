@@ -7,6 +7,7 @@ or removes resources directly: stop/clean use the launcher's recorded namespaces
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime as dt
 import hashlib
 import json
@@ -15,8 +16,11 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 PUBLIC = Path(__file__).resolve().parent
 ROOT = PUBLIC.parent
@@ -117,10 +121,40 @@ def _unique_json(pairs):
     return value
 
 
+def _otlp_attributes(rows):
+    """Read a tiny allowlist of string/bool attributes; never copy arbitrary PII."""
+    if not isinstance(rows, list):
+        raise ValueError("Malformed OTLP span attributes.")
+    values = {}
+    allowed = {"user.id", "demo.order.id", "demo.payment.charged"}
+    for item in rows:
+        if not isinstance(item, dict) or not isinstance(item.get("key"), str):
+            raise ValueError("Malformed OTLP span attribute.")
+        key = item["key"]
+        if key not in allowed:
+            continue
+        if key in values:
+            raise ValueError("Duplicate allowlisted OTLP span attribute.")
+        value = item.get("value")
+        if not isinstance(value, dict):
+            raise ValueError("Malformed allowlisted OTLP span attribute value.")
+        if key == "demo.payment.charged":
+            if type(value.get("boolValue")) is not bool:
+                raise ValueError("Malformed payment-charged OTLP attribute.")
+            values[key] = value["boolValue"]
+        else:
+            text = value.get("stringValue")
+            if not isinstance(text, str) or not text:
+                raise ValueError("Malformed identity OTLP attribute.")
+            values[key] = text
+    return values
+
+
 def parse_otlp_traces(path):
     """Validate actual file-exporter envelopes, not debug text or log records."""
     counts = {}
     checkout_error_users = set()
+    boundary_spans = []
     lines = 0
     with path.open("r", encoding="utf-8", errors="strict") as stream:
         for line in stream:
@@ -175,6 +209,24 @@ def parse_otlp_traces(path):
                         if not 0 < int(start) <= int(end) < 2**64:
                             raise ValueError("Invalid OTLP span timestamp order.")
                         counts[names[0]] = counts.get(names[0], 0) + 1
+                        safe_attributes = _otlp_attributes(span.get("attributes", []))
+                        events = span.get("events", [])
+                        if not isinstance(events, list) or any(
+                            not isinstance(event, dict) or not isinstance(event.get("name"), str)
+                            for event in events
+                        ):
+                            raise ValueError("Malformed OTLP span events.")
+                        if names[0] in ("checkout", "payment", "email"):
+                            boundary_spans.append(
+                                {
+                                    "service": names[0],
+                                    "trace_id": span["traceId"].lower(),
+                                    "email_send_span": names[0] == "email" and span["name"] == "send_email",
+                                    "user_id": safe_attributes.get("user.id"),
+                                    "order_id": safe_attributes.get("demo.order.id"),
+                                    "payment_charged": safe_attributes.get("demo.payment.charged"),
+                                }
+                            )
                         if names[0] == "checkout":
                             status = span.get("status")
                             attributes = span.get("attributes", [])
@@ -200,7 +252,61 @@ def parse_otlp_traces(path):
         "observed_span_count": sum(counts.values()),
         "service_counts": dict(sorted(counts.items())),
         "checkout_error_user_ids": sorted(checkout_error_users),
+        "boundary_spans": boundary_spans,
         "jsonl_lines": lines,
+    }
+
+
+def simulated_boundary_observation(trace_inventory, browser_result):
+    """Join allowlisted demo spans to one browser order without claiming real-world effects."""
+    user = browser_result.get("synthetic_shopper_id")
+    order_id = browser_result.get("order_id")
+    project = browser_result.get("project_id")
+    if not all(isinstance(value, str) and value for value in (user, order_id, project)):
+        return {"status": "UNKNOWN", "reason": "browser-order-binding-missing"}
+    if (
+        trace_inventory.get("project") != project
+        or trace_inventory.get("status") != "OBSERVED_EXPORTED_SPANS"
+    ):
+        return {"status": "UNKNOWN", "reason": "trace-project-unavailable-or-invalid"}
+    spans = trace_inventory.get("boundary_spans")
+    if not isinstance(spans, list):
+        return {"status": "UNKNOWN", "reason": "trace-boundary-spans-unavailable"}
+    checkout = [
+        span
+        for span in spans
+        if span.get("service") == "checkout"
+        and span.get("user_id") == user
+        and span.get("order_id") == order_id
+    ]
+    if len(checkout) != 1:
+        return {"status": "UNKNOWN", "reason": "checkout-order-span-not-unique"}
+    trace_id = checkout[0].get("trace_id")
+    payment = [
+        span
+        for span in spans
+        if span.get("service") == "payment"
+        and span.get("trace_id") == trace_id
+        and span.get("payment_charged") is True
+    ]
+    email = [
+        span
+        for span in spans
+        if span.get("service") == "email"
+        and span.get("trace_id") == trace_id
+        and span.get("email_send_span") is True
+        and span.get("order_id") == order_id
+    ]
+    return {
+        "status": "OBSERVED" if len(payment) == 1 and len(email) == 1 else "UNKNOWN",
+        "synthetic_shopper_id": user,
+        "order_id": order_id,
+        "trace_id": trace_id,
+        "checkout_span_count": len(checkout),
+        "payment_charged_span_count": len(payment),
+        "email_order_span_count": len(email),
+        "email_send_span_count": len(email),
+        "basis": "ALLOWLISTED_PINNED_DEMO_OTEL_SERVICE_SPANS; NOT AN INDEPENDENT JOURNAL, SETTLEMENT, OR EMAIL-DELIVERY PROOF",
     }
 
 
@@ -278,8 +384,15 @@ def telemetry_inventory(evidence, projects):
         try:
             row.update(file_binding(evidence, path))
             row.update(parse_otlp_traces(path))
+            row["status"] = "OBSERVED_EXPORTED_SPANS"
             campaign_path = evidence / "ci" / "campaign.json"
             campaign = read_json(campaign_path) if campaign_path.is_file() else {}
+            browser_result = campaign.get("browser_checkout") if isinstance(campaign, dict) else None
+            if isinstance(browser_result, dict) and browser_result.get("project_id") == project:
+                boundary = simulated_boundary_observation(row, browser_result)
+                row["browser_simulated_boundary_observation"] = boundary
+                if boundary["status"] != "OBSERVED":
+                    raise ValueError("Browser checkout lacks matching simulated payment/order/email spans.")
             story_results = campaign.get("story_results", [])
             if not isinstance(story_results, list):
                 raise ValueError("Campaign story-results record is malformed.")
@@ -303,6 +416,7 @@ def telemetry_inventory(evidence, projects):
                 raise ValueError("Payment-unavailable result has no matching positive checkout error span.")
             row["status"] = "OBSERVED_EXPORTED_SPANS"
         except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+            row["status"] = "UNKNOWN"
             row["error"] = "Missing or invalid trace/result binding; no telemetry qualification."
         records.append(row)
         if directory.exists():
@@ -381,6 +495,94 @@ def privacy_check(evidence):
         with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
             stream.write("allowed=" + ("true" if allowed else "false") + "\n")
     return 0 if allowed else 1
+
+
+def agent_vcr_self_test():
+    """Prove the overlay forces VCR none and an HTTPX cassette miss is rejected."""
+    import importlib.util
+
+    try:
+        import httpx
+        import vcr
+    except ImportError:
+        print("Agent replay guard test requires pinned vcrpy and httpx packages.", file=sys.stderr)
+        return 2
+    overlay = PUBLIC / "agent-replay" / "sitecustomize.py"
+    original_vcr = vcr.VCR
+    prior_guard = os.environ.get("WORKFLOW_LAB_CASSETTE_REPLAY_ONLY")
+    try:
+        os.environ.pop("WORKFLOW_LAB_CASSETTE_REPLAY_ONLY", None)
+        blocked_spec = importlib.util.spec_from_file_location(
+            "workflow_lab_agent_replay_overlay_unset", overlay
+        )
+        if blocked_spec is None or blocked_spec.loader is None:
+            raise RuntimeError("Replay overlay cannot be loaded for its unset-guard check.")
+        blocked_module = importlib.util.module_from_spec(blocked_spec)
+        try:
+            blocked_spec.loader.exec_module(blocked_module)
+        except RuntimeError as error:
+            if str(error) != "The Workflow Lab agent overlay is valid only for explicit cassette replay.":
+                raise
+        else:
+            raise RuntimeError("The replay overlay loaded without explicit replay authorization.")
+        os.environ["WORKFLOW_LAB_CASSETTE_REPLAY_ONLY"] = "1"
+        spec = importlib.util.spec_from_file_location("workflow_lab_agent_replay_overlay", overlay)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("Replay overlay cannot be loaded.")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if vcr.VCR is original_vcr:
+            raise RuntimeError("Replay overlay did not replace the upstream VCR constructor.")
+        with tempfile.TemporaryDirectory() as temporary:
+            cassette = Path(temporary) / "must-not-be-created.yaml"
+            client_vcr = vcr.VCR(cassette_library_dir=temporary, record_mode="new_episodes")
+            if client_vcr.record_mode.value != "none":
+                raise RuntimeError("The replay overlay did not force record_mode=none.")
+
+            async def cassette_miss():
+                with client_vcr.use_cassette(cassette.name):
+                    async with httpx.AsyncClient(timeout=2.0) as client:
+                        await client.post(
+                            "http://127.0.0.1:9/v1/chat/completions",
+                            json={"model": "offline-test", "messages": [{"role": "user", "content": "miss"}]},
+                        )
+
+            try:
+                asyncio.run(cassette_miss())
+            except vcr.errors.CannotOverwriteExistingCassetteException:
+                pass
+            else:
+                raise RuntimeError(
+                    "An unmatched HTTPX request was not rejected by cassette playback-only mode."
+                )
+            if cassette.exists():
+                raise RuntimeError("A cassette miss wrote a new episode.")
+        print(
+            json.dumps(
+                {
+                    "status": "PASS",
+                    "vcrpy_version": vcr.__version__,
+                    "record_mode": "none",
+                    "transport": "HTTPX async client",
+                    "cassette_miss": "rejected before network response",
+                    "cassette_created": False,
+                }
+            )
+        )
+        return 0
+    except Exception as error:
+        print(
+            "Agent replay guard test failed: "
+            + safe_failure_detail(type(error).__name__ + ": " + str(error)),
+            file=sys.stderr,
+        )
+        return 1
+    finally:
+        vcr.VCR = original_vcr
+        if prior_guard is None:
+            os.environ.pop("WORKFLOW_LAB_CASSETTE_REPLAY_ONLY", None)
+        else:
+            os.environ["WORKFLOW_LAB_CASSETTE_REPLAY_ONLY"] = prior_guard
 
 
 def verify_inventory(evidence, before):
@@ -517,6 +719,15 @@ def active_state(base):
     return read_json(directory / "state.json")
 
 
+def active_state_path(base):
+    directory = base
+    if (base / "active.json").is_file():
+        directory = base / read_json(base / "active.json")["world"]
+    if not directory.resolve().is_relative_to(base.resolve()):
+        raise ValueError("The active shop record escapes the selected CI folder.")
+    return directory / "state.json"
+
+
 def assert_fresh(before, after, context, *, empty=False):
     if before["project"] == after["project"] or after["docker_context"] != context:
         raise RuntimeError("Reset/replay did not preserve context and create a fresh shop.")
@@ -550,6 +761,235 @@ def verify_same_world_restart(before, after, user, status, payload, expected_car
         "matches_pre_restart_observation": True,
         "basis": "same recorded project and synthetic shopper; direct HTTP API readback after stop/start",
     }
+
+
+def observe_store_for_result(state, result, *, runner=shop_app.native):
+    """Join one API result to read-only Valkey observations in the same project."""
+    if result.get("project_id") != state.get("project"):
+        raise RuntimeError("Direct cart observation refused a result from another Compose project.")
+    actors = result.get("HTTP_carts_by_synthetic_actor")
+    if actors is None:
+        user = result.get("synthetic_shopper_id")
+        if not isinstance(user, str):
+            raise RuntimeError("Direct cart observation has no bound synthetic shopper.")
+        actors = {user: result.get("cart_after")}
+    if not isinstance(actors, dict) or not actors:
+        raise RuntimeError("Direct cart observation has no actor/cart mapping.")
+    observations = {}
+    for user, expected_items in actors.items():
+        if not isinstance(expected_items, list):
+            observations[user] = {"status": "UNKNOWN", "comparison": "UNKNOWN"}
+            continue
+        observed = shop_app.read_valkey_cart(state, user, runner)
+        comparison = shop_app.compare_valkey_cart(user, expected_items, observed)
+        observations[user] = {**observed, "comparison": comparison}
+    comparisons = [row["comparison"] for row in observations.values()]
+    status = (
+        "CONTRADICTED"
+        if "CONTRADICTED" in comparisons
+        else "UNKNOWN"
+        if any(value != "MATCHED_API_READBACK" for value in comparisons)
+        else "MATCHED"
+    )
+    return {
+        "status": status,
+        "project_id": state["project"],
+        "source_commit": state.get("source_commit"),
+        "docker_context": state["docker_context"],
+        "config_sha256": hashlib.sha256(Path(state["config"]).read_bytes()).hexdigest(),
+        "actors": observations,
+        "interpretation": "READ_ONLY_VALKEY_SNAPSHOT_JOINED_TO_HTTP_OR_MCP_PROJECTION; NOT_AUTHORIZATION_OR_RUNTIME_EFFECT_PROOF",
+    }
+
+
+def demote_unconfirmed_users(base, state, result):
+    users = result.get("HTTP_carts_by_synthetic_actor")
+    if not isinstance(users, dict):
+        user = result.get("synthetic_shopper_id")
+        users = {user: None} if isinstance(user, str) else {}
+    for user in users:
+        if user in state.get("users", {}):
+            state["users"][user] = {
+                "status": "UNKNOWN_AFTER_DISPATCH",
+                "story": result.get("story", "unknown"),
+            }
+    write_json(active_state_path(base), state)
+
+
+def catalog_status_matrix(summary, catalog, error=None):
+    """Expose completed and deliberately-not-run stories after a fail-closed stop."""
+    results = summary.get("story_results", [])
+    counts = {
+        story: sum(1 for row in results if isinstance(row, dict) and row.get("story") == story)
+        for story in catalog
+    }
+    return [
+        {
+            "story": story,
+            "completed_observations": counts[story],
+            "status": "REPLAYED"
+            if counts[story] >= 2
+            else "OBSERVED_ONCE"
+            if counts[story] == 1
+            else "NOT_RUN",
+            **({"blocker": error} if counts[story] < 2 and error else {}),
+        }
+        for story in catalog
+    ]
+
+
+def validate_agent_replay_result(run_record, result, *, expected_overlay_sha256):
+    """Accept only a durable, pinned playback-only read-only agent result."""
+    return (
+        isinstance(run_record, dict)
+        and run_record.get("status") == "passed"
+        and isinstance(result, dict)
+        and result.get("status") == "FIXTURE_REPLAY"
+        and result.get("source_commit") == shop_app.SOURCE_COMMIT
+        and result.get("model") == shop_app.AGENT_REPLAY_MODEL
+        and result.get("prompt") == "Show all available products in the store."
+        and result.get("cassette_sha256") == shop_app.AGENT_CASSETTE_SHA256
+        and result.get("overlay_sha256") == expected_overlay_sha256
+        and result.get("vcrpy_version") == shop_app.AGENT_VCRPY_VERSION
+        and result.get("record_mode") == "none"
+        and result.get("match_threshold") == "1.0"
+        and result.get("tool_names") == ["list_products"]
+        and result.get("agent_stopped") is True
+        and result.get("live_inference") is False
+    )
+
+
+def run_browser_checkout(state, *, on_prepared, on_dispatch, browser_timeout_ms=30000):
+    """Perform one real Chromium checkout with fictional data and loopback-only requests."""
+    from playwright.sync_api import sync_playwright
+
+    user = "shop-" + str(uuid.uuid4())
+    shop_app.validate_user(user)
+    status, products = shop_app.request(state["http_port"], "GET", "/api/products?currencyCode=USD")
+    if status != 200 or not isinstance(products, list) or not products:
+        raise RuntimeError("Browser checkout lacks a read-only catalogue; no browser attempt was made.")
+    status, _ = shop_app.request(
+        state["http_port"],
+        "POST",
+        "/api/cart?currencyCode=USD",
+        {"userId": user, "item": {"productId": products[0]["id"], "quantity": 1}},
+    )
+    if status != 200:
+        raise RuntimeError("Browser checkout cart preparation failed; no checkout was attempted.")
+    before_status, before = shop_app.request(
+        state["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD"
+    )
+    before_items = shop_app.cart_items(before, expected_user=user) if before_status == 200 else None
+    if before_items != [{"product_id": products[0]["id"], "quantity": 1}]:
+        raise RuntimeError("Browser checkout prestate is not the requested single synthetic item.")
+    on_prepared(user)
+
+    fixture = shop_app.synthetic_fixture()
+    if shop_app._RECORDER is not None:
+        shop_app._RECORDER.set_redactions([fixture["email"], fixture["creditCard"]["creditCardNumber"]])
+    session = json.dumps({"userId": user, "currencyCode": "USD"}, separators=(",", ":"))
+    base_url = "http://127.0.0.1:" + str(state["http_port"])
+    checkout_requests = []
+    blocked_hosts = set()
+    browser_result = {
+        "story": "browser-normal-checkout",
+        "project_id": state["project"],
+        "synthetic_shopper_id": user,
+        "status": "UNKNOWN",
+    }
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            context = browser.new_context()
+            context.add_init_script(
+                "if (location.origin !== 'null') localStorage.setItem('session', "
+                + json.dumps(session)
+                + ");"
+            )
+
+            def route_request(route):
+                parsed = urlsplit(route.request.url)
+                if parsed.scheme not in ("http", "https") or parsed.hostname not in (
+                    "127.0.0.1",
+                    "localhost",
+                ):
+                    blocked_hosts.add(parsed.hostname or "non-http")
+                    route.abort()
+                else:
+                    route.continue_()
+
+            context.route("**/*", route_request)
+            page = context.new_page()
+            page.set_default_timeout(browser_timeout_ms)
+
+            def on_request(request):
+                parsed = urlsplit(request.url)
+                if request.method == "POST" and parsed.path == "/api/checkout":
+                    checkout_requests.append({"method": request.method, "path": parsed.path})
+                    on_dispatch(user)
+
+            page.on("request", on_request)
+            page.goto(base_url + "/cart", wait_until="domcontentloaded")
+            page.locator("#email").fill(fixture["email"])
+            page.locator("#street_address").fill(fixture["address"]["streetAddress"])
+            page.locator("#zip_code").fill(fixture["address"]["zipCode"])
+            page.locator("#city").fill(fixture["address"]["city"])
+            page.locator("#state").fill(fixture["address"]["state"])
+            page.locator("#country").fill(fixture["address"]["country"])
+            card_number = fixture["creditCard"]["creditCardNumber"]
+            card_number = "-".join(card_number[index : index + 4] for index in range(0, 16, 4))
+            page.locator("#credit_card_number").fill(card_number)
+            page.locator("#credit_card_cvv").fill(str(fixture["creditCard"]["creditCardCvv"]))
+            page.locator("#credit_card_expiration_month").select_option(
+                str(fixture["creditCard"]["creditCardExpirationMonth"])
+            )
+            page.locator("#credit_card_expiration_year").select_option(
+                str(fixture["creditCard"]["creditCardExpirationYear"])
+            )
+            with page.expect_response(
+                lambda response: urlsplit(response.url).path == "/api/checkout", timeout=browser_timeout_ms
+            ) as response_info:
+                page.locator('[data-cy="checkout-place-order"]').click()
+            response = response_info.value
+            payload = response.json()
+            order_present = isinstance(payload, dict) and bool(payload.get("orderId"))
+            page.get_by_text("Your order is complete!", exact=True).wait_for()
+            if (
+                len(checkout_requests) != 1
+                or response.status != 200
+                or not order_present
+                or not urlsplit(page.url).path.startswith("/cart/checkout/")
+            ):
+                raise RuntimeError(
+                    "browser predicate failed: expected one checkout request, HTTP 200 order, and checkout receipt page"
+                )
+            after_status, after = shop_app.request(
+                state["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD"
+            )
+            after_items = shop_app.cart_items(after, expected_user=user) if after_status == 200 else None
+            browser_result.update(
+                status="API_AND_BROWSER_OBSERVED" if after_items == [] else "UNKNOWN",
+                checkout_request_count=len(checkout_requests),
+                checkout_HTTP_status=response.status,
+                order_response_present=order_present,
+                order_id=payload.get("orderId") if order_present else None,
+                cart_HTTP_status=after_status,
+                cart_before=before_items,
+                cart_after=after_items,
+                blocked_external_hosts=sorted(blocked_hosts),
+                basis="REAL_CHROMIUM_UI_AND_HTTP_RESPONSE; EFFECT_STATE_REQUIRES_INDEPENDENT_VALKEY_JOIN",
+            )
+            return browser_result
+        except Exception as error:
+            if checkout_requests:
+                raise RuntimeError(
+                    "Browser checkout failed after dispatch; outcome UNKNOWN, no retry was made."
+                ) from error
+            raise RuntimeError(
+                "Browser checkout failed before dispatch; no checkout was attempted."
+            ) from error
+        finally:
+            browser.close()
 
 
 def observe_same_world_restart(campaign, result, before):
@@ -618,18 +1058,11 @@ def semantic_outcome(result):
             "host_cart_contents": result.get("host_cart_after"),
             "cart_identity_observations": result.get("cart_identity_observations"),
         }
-    if story == "shared-cart-overlap":
-        clients = result.get("concurrent_client_results", [])
+    if story == "shared-cart-overlap-diagnostic":
         return {
             **common,
-            "client_request_windows_overlapped": result.get("concurrency_claim")
-            == "CLIENT_REQUEST_WINDOWS_OVERLAPPED_SERVER_HANDLER_OVERLAP_NOT_ESTABLISHED",
-            "client_statuses": [row.get("status") for row in clients],
-            "final_cart_observation_recorded": result.get("final_cart_observation")
-            in {
-                "BOTH_ITEMS_RETAINED",
-                "ONE_UPDATE_NOT_PRESENT",
-            },
+            "diagnostic_completed": assessment.get("passed") is True,
+            "service_handler_overlap_claim": "NOT_ESTABLISHED",
         }
     raise ValueError("No stable semantic comparison is defined for this story.")
 
@@ -716,7 +1149,7 @@ class Campaign:
             command = run.get("command") if isinstance(run, dict) else None
             if (
                 isinstance(command, str)
-                and command in {"setup", "start", "story", "reset", "replay", "stop", "clean"}
+                and command in {"setup", "start", "story", "reset", "replay", "stop", "clean", "agent-replay"}
                 and (expected_command is None or command == expected_command)
                 and run.get("status") == "failed"
                 and isinstance(run.get("finished_at"), str)
@@ -777,6 +1210,7 @@ class Campaign:
                 "replay",
                 "stop",
                 "clean",
+                "agent-replay",
             }
             else "unknown"
         )
@@ -999,9 +1433,55 @@ def self_test():
                     with self.assertRaises((RuntimeError, ValueError)):
                         verify_same_world_restart(before, changed_after, user, status, body, cart)
 
+        def test_direct_valkey_join_is_bound_to_project_and_fails_closed(self):
+            config = self.base / "compose.json"
+            config.write_text("{}", encoding="utf-8")
+            user_a = "shop-11111111-1111-4111-8111-111111111111"
+            user_b = "shop-22222222-2222-4222-8222-222222222222"
+            state = {
+                "project": "shop-0123456789ab",
+                "docker_context": "captured-engine",
+                "engine_id": "engine-test",
+                "config": str(config),
+                "source_variant": "original",
+                "source_commit": shop_app.SOURCE_COMMIT,
+            }
+            config_data = config.read_bytes()
+            state["input_bindings"] = {
+                "compose": {"sha256": sha256(config), "bytes": len(config_data)},
+                "routing": shop_app.routing_binding(state),
+            }
+            result = {
+                "project_id": state["project"],
+                "HTTP_carts_by_synthetic_actor": {user_a: [], user_b: []},
+            }
+
+            def runner(args):
+                return "engine-test" if "info" in args else "1\n\n"
+
+            matched = observe_store_for_result(state, result, runner=runner)
+            self.assertEqual(matched["status"], "MATCHED")
+            self.assertEqual(set(matched["actors"]), {user_a, user_b})
+            missing = observe_store_for_result(
+                state, result, runner=lambda args: "engine-test" if "info" in args else "0\n\n"
+            )
+            self.assertEqual(missing["status"], "UNKNOWN")
+            contradictory = observe_store_for_result(
+                state,
+                {
+                    "project_id": state["project"],
+                    "synthetic_shopper_id": user_a,
+                    "cart_after": [{"product_id": "x", "quantity": 1}],
+                },
+                runner=runner,
+            )
+            self.assertEqual(contradictory["actors"][user_a]["comparison"], "CONTRADICTED")
+            with self.assertRaises(RuntimeError):
+                observe_store_for_result({**state, "project": "shop-aaaaaaaaaaaa"}, result, runner=runner)
+
         def test_campaign_action_supplies_bound_cart_to_same_world_restart(self):
             user = "shop-11111111-1111-4111-8111-111111111111"
-            cart = [{"product_id": "demo-product", "quantity": 1}]
+            cart = []
             state = {
                 "project": "shop-0123456789ab",
                 "config": "/fixture/compose.json",
@@ -1023,28 +1503,93 @@ def self_test():
                     write_json(
                         run / "result.json",
                         {
-                            "story": "shared-cart-overlap",
-                            "assessment": {"passed": True, "expected": "overlap-observed"},
+                            "story": "shared-cart-conflict",
+                            "assessment": {"passed": True, "expected": "ordered-conflict"},
                             "project_id": state["project"],
                             "synthetic_shopper_id": user,
                             "cart_after": cart,
-                            "concurrency_claim": "CLIENT_REQUEST_WINDOWS_OVERLAPPED_SERVER_HANDLER_OVERLAP_NOT_ESTABLISHED",
-                            "concurrent_client_results": [{"status": 200}, {"status": 200}],
-                            "final_cart_observation": "ONE_UPDATE_NOT_PRESENT",
+                            "actor_intents": [
+                                {"intent": "retain-added-item"},
+                                {"intent": "clear-shared-cart"},
+                            ],
+                            "ordered_client_results": [
+                                {"cart_after": [{"product_id": "demo-product", "quantity": 1}]},
+                                {"cart_after": [], "delete_status": 204},
+                            ],
                         },
                     )
                 else:
                     lifecycle_calls.append(args[0])
 
             self.campaign.cli = fake_cli
-            action = self.campaign.action(["story", "shared-cart-overlap"], "shared-cart-overlap")
+            action = self.campaign.action(["story", "shared-cart-conflict"], "shared-cart-conflict")
             self.assertEqual(action["synthetic_shopper_id"], user)
             self.assertEqual(action["cart_after"], cart)
-            payload = {"userId": user, "items": [{"productId": "demo-product", "quantity": 1}]}
+            payload = {"userId": user, "items": []}
             with mock.patch.object(shop_app, "request", return_value=(200, payload)):
                 result = observe_same_world_restart(self.campaign, action, state)
             self.assertEqual(lifecycle_calls, ["stop", "start"])
             self.assertTrue(result["matches_pre_restart_observation"])
+
+        def test_failed_campaign_exposes_completed_and_not_run_catalog_rows(self):
+            summary = {
+                "story_results": [
+                    {"story": "normal-checkout"},
+                    {"story": "normal-checkout"},
+                    {"story": "cart-failure"},
+                ]
+            }
+            rows = catalog_status_matrix(
+                summary,
+                ["normal-checkout", "cart-failure", "payment-unreachable"],
+                "prior result UNKNOWN",
+            )
+            self.assertEqual([row["status"] for row in rows], ["REPLAYED", "OBSERVED_ONCE", "NOT_RUN"])
+            self.assertEqual(rows[2]["blocker"], "prior result UNKNOWN")
+
+        def test_agent_replay_result_requires_exact_pinned_playback_and_cleanup(self):
+            overlay = Path(shop_app.AGENT_REPLAY_OVERLAY)
+            overlay_hash = sha256(overlay)
+            result = {
+                "status": "FIXTURE_REPLAY",
+                "source_commit": shop_app.SOURCE_COMMIT,
+                "model": shop_app.AGENT_REPLAY_MODEL,
+                "prompt": "Show all available products in the store.",
+                "cassette_sha256": shop_app.AGENT_CASSETTE_SHA256,
+                "overlay_sha256": overlay_hash,
+                "vcrpy_version": shop_app.AGENT_VCRPY_VERSION,
+                "record_mode": "none",
+                "match_threshold": "1.0",
+                "tool_names": ["list_products"],
+                "agent_stopped": True,
+                "live_inference": False,
+            }
+            self.assertTrue(
+                validate_agent_replay_result(
+                    {"status": "passed"}, result, expected_overlay_sha256=overlay_hash
+                )
+            )
+            for field, value in (
+                ("record_mode", "new_episodes"),
+                ("cassette_sha256", "0" * 64),
+                ("overlay_sha256", "0" * 64),
+                ("tool_names", ["checkout"]),
+                ("agent_stopped", False),
+                ("live_inference", True),
+            ):
+                with self.subTest(field=field):
+                    self.assertFalse(
+                        validate_agent_replay_result(
+                            {"status": "passed"},
+                            {**result, field: value},
+                            expected_overlay_sha256=overlay_hash,
+                        )
+                    )
+            self.assertFalse(
+                validate_agent_replay_result(
+                    {"status": "failed"}, result, expected_overlay_sha256=overlay_hash
+                )
+            )
 
         def test_semantic_mcp_repeatability_ignores_actor_ids_not_cart_mismatch(self):
             first = {
@@ -1077,25 +1622,6 @@ def self_test():
             }
             self.assertEqual(semantic_outcome(first), semantic_outcome(replay))
             replay["MCP_carts_by_synthetic_actor"]["fresh-two"] = []
-            self.assertNotEqual(semantic_outcome(first), semantic_outcome(replay))
-
-        def test_overlap_replay_compares_observation_completeness_not_race_outcome(self):
-            first = {
-                "story": "shared-cart-overlap",
-                "assessment": {"passed": True, "expected": "overlap-observed"},
-                "concurrency_claim": "CLIENT_REQUEST_WINDOWS_OVERLAPPED_SERVER_HANDLER_OVERLAP_NOT_ESTABLISHED",
-                "concurrent_client_results": [
-                    {"status": 200},
-                    {"status": 200},
-                ],
-                "final_cart_observation": "BOTH_ITEMS_RETAINED",
-            }
-            replay = {
-                **first,
-                "final_cart_observation": "ONE_UPDATE_NOT_PRESENT",
-            }
-            self.assertEqual(semantic_outcome(first), semantic_outcome(replay))
-            replay["concurrency_claim"] = "SERVER_HANDLER_OVERLAP_PROVEN"
             self.assertNotEqual(semantic_outcome(first), semantic_outcome(replay))
 
         def test_identity_evidence_changes_stable_comparison(self):
@@ -1256,6 +1782,143 @@ def self_test():
             self.assertEqual(row["service_counts"], {"frontend": 2})
             self.assertEqual(row["sha256"], sha256(path))
             self.assertEqual(row["bytes"], path.stat().st_size)
+
+        def test_otlp_boundary_join_uses_allowlisted_pinned_demo_fields_only(self):
+            user = "shop-11111111-1111-4111-8111-111111111111"
+            order = "22222222-2222-4222-8222-222222222222"
+            trace_id = "a" * 32
+
+            def span(name, attributes):
+                return {
+                    "name": name,
+                    "traceId": trace_id,
+                    "spanId": uuid.uuid4().hex[:16],
+                    "startTimeUnixNano": "100",
+                    "endTimeUnixNano": "200",
+                    "attributes": attributes,
+                }
+
+            def string_attr(key, value):
+                return {"key": key, "value": {"stringValue": value}}
+
+            def service(name, spans):
+                return {
+                    "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": name}}]},
+                    "scopeSpans": [{"spans": spans}],
+                }
+
+            record = {
+                "resourceSpans": [
+                    service(
+                        "checkout",
+                        [
+                            span(
+                                "PlaceOrder",
+                                [
+                                    string_attr("user.id", user),
+                                    string_attr("demo.order.id", order),
+                                    string_attr("user.email", "sensitive@example.test"),
+                                ],
+                            )
+                        ],
+                    ),
+                    service(
+                        "payment",
+                        [
+                            span(
+                                "Charge",
+                                [{"key": "demo.payment.charged", "value": {"boolValue": True}}],
+                            )
+                        ],
+                    ),
+                    service("email", [span("send_email", [string_attr("demo.order.id", order)])]),
+                ]
+            }
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "traces.jsonl"
+                path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+                inventory = parse_otlp_traces(path)
+            self.assertNotIn("sensitive@example.test", json.dumps(inventory))
+            observation = simulated_boundary_observation(
+                {**inventory, "project": "shop-" + "d" * 12, "status": "OBSERVED_EXPORTED_SPANS"},
+                {
+                    "project_id": "shop-" + "d" * 12,
+                    "synthetic_shopper_id": user,
+                    "order_id": order,
+                },
+            )
+            self.assertEqual(observation["status"], "OBSERVED")
+            no_payment = json.loads(json.dumps(inventory))
+            no_payment["boundary_spans"][1]["payment_charged"] = False
+            self.assertEqual(
+                simulated_boundary_observation(
+                    {**no_payment, "project": "shop-" + "d" * 12, "status": "OBSERVED_EXPORTED_SPANS"},
+                    {
+                        "project_id": "shop-" + "d" * 12,
+                        "synthetic_shopper_id": user,
+                        "order_id": order,
+                    },
+                )["status"],
+                "UNKNOWN",
+            )
+
+        def test_simulated_checkout_boundaries_require_same_trace_and_order(self):
+            project = "shop-" + "d" * 12
+            user = "shop-11111111-1111-4111-8111-111111111111"
+            order = "22222222-2222-4222-8222-222222222222"
+            trace_id = "a" * 32
+            inventory = {
+                "project": project,
+                "status": "OBSERVED_EXPORTED_SPANS",
+                "boundary_spans": [
+                    {
+                        "service": "checkout",
+                        "trace_id": trace_id,
+                        "email_send_span": False,
+                        "user_id": user,
+                        "order_id": order,
+                        "payment_charged": None,
+                        "charged_event": True,
+                    },
+                    {
+                        "service": "payment",
+                        "trace_id": trace_id,
+                        "email_send_span": False,
+                        "user_id": None,
+                        "order_id": None,
+                        "payment_charged": True,
+                        "charged_event": False,
+                    },
+                    {
+                        "service": "email",
+                        "trace_id": trace_id,
+                        "email_send_span": True,
+                        "user_id": None,
+                        "order_id": order,
+                        "payment_charged": None,
+                        "charged_event": False,
+                    },
+                ],
+            }
+            browser = {
+                "project_id": project,
+                "synthetic_shopper_id": user,
+                "order_id": order,
+            }
+            observed = simulated_boundary_observation(inventory, browser)
+            self.assertEqual(observed["status"], "OBSERVED")
+            self.assertIn("NOT AN INDEPENDENT JOURNAL", observed["basis"])
+            missing_payment = json.loads(json.dumps(inventory))
+            missing_payment["boundary_spans"][1]["payment_charged"] = False
+            self.assertEqual(simulated_boundary_observation(missing_payment, browser)["status"], "UNKNOWN")
+            wrong_trace = json.loads(json.dumps(inventory))
+            wrong_trace["boundary_spans"][2]["trace_id"] = "b" * 32
+            self.assertEqual(simulated_boundary_observation(wrong_trace, browser)["status"], "UNKNOWN")
+            wrong_order = json.loads(json.dumps(inventory))
+            wrong_order["boundary_spans"][2]["order_id"] = "33333333-3333-4333-8333-333333333333"
+            self.assertEqual(simulated_boundary_observation(wrong_order, browser)["status"], "UNKNOWN")
+            self.assertNotIn("shopper@example.test", json.dumps(observed))
+            self.assertNotIn("4111111111111111", json.dumps(observed))
 
         def payment_result(self, project, shopper, **changes):
             result = {
@@ -1493,6 +2156,16 @@ def main(argv=None):
         "--self-test", action="store_true", help="Run inert CI orchestration regressions only."
     )
     parser.add_argument(
+        "--agent-vcr-self-test",
+        action="store_true",
+        help="Prove the pinned replay-only VCR overlay rejects an HTTPX cassette miss without network access.",
+    )
+    parser.add_argument(
+        "--agent-replay",
+        action="store_true",
+        help="Include one pinned, replay-only public agent endpoint call in the Docker campaign.",
+    )
+    parser.add_argument(
         "--privacy-check",
         "--privacy-only",
         dest="privacy_check",
@@ -1502,6 +2175,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.self_test:
         return self_test()
+    if args.agent_vcr_self_test:
+        return agent_vcr_self_test()
     if args.privacy_check:
         evidence = args.evidence_dir.resolve()
         if not evidence.is_dir():
@@ -1516,6 +2191,7 @@ def main(argv=None):
         "status": "RUNNING",
         "story_results": [],
         "runtime_scope": "public sample observations only",
+        "agent_replay": {"status": "PENDING" if args.agent_replay else "NOT_REQUESTED"},
     }
     success = False
     try:
@@ -1545,13 +2221,66 @@ def main(argv=None):
             read_json(PUBLIC / "runtime-images.lock.json"),
             campaign.receipts / "required-image-cold-census.json",
         )
-        campaign.cli("setup", "--context", context)
+        campaign.cli("setup", "--context", context, *(["--agent-replay"] if args.agent_replay else []))
         campaign.cli("start", next(iter(catalog)))
+
+        def mark_browser_dispatch(user):
+            state = active_state(campaign.state)
+            if state.get("users", {}).get(user, {}).get("status") != "PREPARED_NO_CHECKOUT":
+                raise RuntimeError("Browser checkout shopper is not in its single-use prepared state.")
+            state["users"][user] = {"status": "UNKNOWN_AFTER_DISPATCH", "story": "browser-normal-checkout"}
+            write_json(active_state_path(campaign.state), state)
+
+        def mark_browser_prepared(user):
+            state = active_state(campaign.state)
+            if user in state.get("users", {}):
+                raise RuntimeError("Browser checkout shopper was already used; no retry is allowed.")
+            state.setdefault("users", {})[user] = {
+                "status": "PREPARED_NO_CHECKOUT",
+                "story": "browser-normal-checkout",
+            }
+            write_json(active_state_path(campaign.state), state)
+
+        browser_result = run_browser_checkout(
+            active_state(campaign.state), on_prepared=mark_browser_prepared, on_dispatch=mark_browser_dispatch
+        )
+        browser_state = active_state(campaign.state)
+        browser_observation = shop_app.read_valkey_cart(browser_state, browser_result["synthetic_shopper_id"])
+        browser_comparison = shop_app.compare_valkey_cart(
+            browser_result["synthetic_shopper_id"], browser_result.get("cart_after"), browser_observation
+        )
+        browser_result["independent_valkey_observation"] = {
+            **browser_observation,
+            "comparison": browser_comparison,
+        }
+        if (
+            browser_result.get("status") != "API_AND_BROWSER_OBSERVED"
+            or browser_comparison != "MATCHED_API_READBACK"
+        ):
+            summary["browser_checkout"] = browser_result
+            demote_unconfirmed_users(campaign.state, browser_state, browser_result)
+            write_json(campaign.receipts / "campaign.json", summary)
+            raise RuntimeError("Browser checkout or its independent Valkey join is unknown/contradicted.")
+        browser_state["users"][browser_result["synthetic_shopper_id"]]["status"] = "OBSERVED"
+        write_json(active_state_path(campaign.state), browser_state)
+        summary["browser_checkout"] = browser_result
+        write_json(campaign.receipts / "campaign.json", summary)
+
         for story in catalog:
             first = campaign.action(["story", story], story)
+            story_state = active_state(campaign.state)
+            run_path = campaign.evidence / first["run"]
+            result = read_json(run_path.parent / "result.json")
+            first["independent_valkey_observation"] = observe_store_for_result(story_state, result)
             summary["story_results"].append(first)
+            write_json(campaign.receipts / "campaign.json", summary)
+            if first["independent_valkey_observation"]["status"] != "MATCHED":
+                demote_unconfirmed_users(campaign.state, story_state, result)
+                raise RuntimeError(
+                    "Independent Valkey state is missing, stale or contradicts the story projection."
+                )
             previous = active_state(campaign.state)
-            if story == "shared-cart-overlap":
+            if story == "shared-cart-conflict":
                 observation = observe_same_world_restart(campaign, first, previous)
                 summary["same_world_restart_observation"] = observation
                 previous = active_state(campaign.state)
@@ -1567,10 +2296,63 @@ def main(argv=None):
             if set(previous.get("users", {})) & set(replay.get("users", {})):
                 raise RuntimeError("Explicit replay reused the first story shopper.")
             write_json(campaign.receipts / "campaign.json", summary)
+        if args.agent_replay:
+            summary["agent_replay"] = {"status": "RUNNING"}
+            write_json(campaign.receipts / "campaign.json", summary)
+            prior_runs = set((campaign.evidence / "runs").glob("*/run.json"))
+            campaign.cli("agent-replay")
+            new_runs = {
+                path
+                for path in set((campaign.evidence / "runs").glob("*/run.json")) - prior_runs
+                if read_json(path).get("command") == "agent-replay"
+            }
+            if len(new_runs) != 1:
+                raise RuntimeError("The agent fixture replay did not produce one durable command result.")
+            run_path = new_runs.pop()
+            agent_run = read_json(run_path)
+            agent_result = read_json(run_path.parent / "result.json")
+            if not validate_agent_replay_result(
+                agent_run,
+                agent_result,
+                expected_overlay_sha256=sha256(shop_app.AGENT_REPLAY_OVERLAY),
+            ):
+                raise RuntimeError(
+                    "The agent endpoint result did not prove the pinned read-only fixture replay."
+                )
+            summary["agent_replay"] = {
+                "status": "FIXTURE_REPLAY",
+                "run": str(run_path.relative_to(campaign.evidence)),
+                "run_sha256": sha256(run_path),
+                "result_sha256": sha256(run_path.parent / "result.json"),
+                "source_commit": agent_result["source_commit"],
+                "model": agent_result["model"],
+                "cassette_sha256": agent_result["cassette_sha256"],
+                "overlay_sha256": agent_result["overlay_sha256"],
+                "vcrpy_version": agent_result["vcrpy_version"],
+                "record_mode": agent_result["record_mode"],
+                "match_threshold": agent_result["match_threshold"],
+                "tool_names": agent_result["tool_names"],
+                "agent_stopped": True,
+                "live_inference": False,
+            }
+            write_json(campaign.receipts / "campaign.json", summary)
         success = True
-    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
-        summary["error"] = str(error)
-        print("Shop CI stopped: " + str(error), file=sys.stderr)
+    except Exception as error:
+        summary["error"] = safe_failure_detail(str(error), limit=300)
+        if summary.get("agent_replay", {}).get("status") == "RUNNING":
+            summary["agent_replay"] = {
+                "status": "UNKNOWN",
+                "blocker": summary["error"],
+            }
+        elif summary.get("agent_replay", {}).get("status") == "PENDING":
+            summary["agent_replay"] = {
+                "status": "NOT_RUN",
+                "blocker": summary["error"],
+            }
+        summary["catalog_status"] = catalog_status_matrix(
+            summary, summary.get("stories", []), summary["error"]
+        )
+        print("Shop CI stopped: " + summary["error"], file=sys.stderr)
     finally:
         cleaned = campaign.cleanup()
         summary.update(

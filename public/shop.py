@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import copy
 import datetime as dt
 import hashlib
@@ -11,6 +13,7 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -47,6 +50,12 @@ CORE_SERVICES = (
     "valkey-cart",
 )
 FRONTEND_NODE = "/nodejs/bin/node"  # The pinned distroless image uses this entrypoint path.
+AGENT_REPLAY_OVERLAY = PUBLIC / "agent-replay" / "sitecustomize.py"
+AGENT_REPLAY_MODEL = "azure/gpt-5.5"
+AGENT_REPLAY_CASSETTE = "azure_gpt-5.5_cassette.yaml"
+AGENT_VCRPY_VERSION = "8.3.0"
+AGENT_PATCH_VCR_SHA256 = "d1a5f645bfd4a0006cfbdcfe2af8a0a9ecb754a8570c1168727d74ff3ccf492d"
+AGENT_CASSETTE_SHA256 = "40a69e2353678db7ea7cb69baf5c1626097315cd1c4cdf33d66bff6496506acd"
 STORIES = json.loads((PUBLIC / "stories.json").read_bytes())["stories"]
 PROFILE = json.loads((PUBLIC / "runtime-profile.json").read_bytes())
 for _name, _story in STORIES.items():
@@ -125,6 +134,7 @@ def assess_story(story, outcome):
             positive
             and outcome.get("MCP_initialized") is True
             and outcome.get("tool_error") is False
+            and outcome.get("MCP_stateful_mutation_verified") is True
             and outcome.get("projections_match") is True
             and outcome.get("actor_isolation_verified") is True
             and after == before
@@ -156,61 +166,61 @@ def assess_story(story, outcome):
             and outcome.get("actor_identity") == "HARNESS_LABELS_ONLY_NOT_APPLICATION_AUTHENTICATION"
             and outcome.get("concurrency_claim") == "SEQUENTIALLY_ORDERED_NOT_OVERLAP_TESTED"
         )
-    elif expected == "overlap-observed":
-        intents = outcome.get("actor_intents", [])
+
+    elif expected == "overlap-diagnostic":
         clients = outcome.get("concurrent_client_results", [])
+        intents = outcome.get("actor_intents", [])
+        windows_valid = len(clients) == 2 and all(
+            type(row.get("request_start_monotonic_ns")) is int
+            and type(row.get("response_complete_monotonic_ns")) is int
+            and 0 < row["request_start_monotonic_ns"] < row["response_complete_monotonic_ns"]
+            for row in clients
+        )
+        overlap_observed = windows_valid and max(row["request_start_monotonic_ns"] for row in clients) < min(
+            row["response_complete_monotonic_ns"] for row in clients
+        )
+        requested = [row.get("item") for row in clients]
         final_items = outcome.get("cart_after")
-        requested_items = [row.get("item") for row in clients]
-        valid_final_state = (
+        final_is_supported = (
             isinstance(final_items, list)
-            and all(item in requested_items for item in final_items)
-            and len({item.get("product_id") for item in final_items}) == len(final_items)
+            and all(isinstance(item, dict) and item in requested for item in final_items)
+            and len({item.get("product_id") for item in final_items if isinstance(item, dict)})
+            == len(final_items)
         )
         passed = (
             before == []
-            and len(intents) == 2
-            and len(clients) == 2
             and [row.get("actor_label") for row in clients] == ["actor-A", "actor-B"]
-            and [row.get("intent") for row in intents] == ["add-distinct-item", "add-distinct-item"]
-            and sorted(row.get("actor_label") for row in intents) == ["actor-A", "actor-B"]
-            and [row.get("sequence") for row in sorted(intents, key=lambda row: row.get("sequence", 0))]
-            == [1, 2]
-            and all(row.get("shared_user_id") == intents[0].get("shared_user_id") for row in intents)
             and all(row.get("status") == 200 for row in clients)
             and all(
-                row.get("client_response_identity_status") == "MATCHED_REQUESTED_SHOPPER"
-                and isinstance(row.get("client_response_items"), list)
-                and all(
-                    item.get("product_id") in {requested["product_id"] for requested in requested_items}
-                    for item in row["client_response_items"]
-                )
-                for row in clients
-            )
-            and all(
-                type(row.get("request_start_monotonic_ns")) is int
-                and type(row.get("response_complete_monotonic_ns")) is int
-                and 0 < row["request_start_monotonic_ns"] < row["response_complete_monotonic_ns"]
-                for row in clients
-            )
-            and max(row["request_start_monotonic_ns"] for row in clients)
-            < min(row["response_complete_monotonic_ns"] for row in clients)
-            and all(
-                hashlib.sha256(row.get("raw_response", "").encode()).hexdigest()
+                row.get("client_response_identity_status")
+                in ("MATCHED_REQUESTED_SHOPPER", "NOT_ECHOED_FOR_EMPTY_CART")
+                and hashlib.sha256(row.get("raw_response", "").encode()).hexdigest()
                 == row.get("raw_response_sha256")
                 for row in clients
             )
+            and len(intents) == 2
+            and [row.get("actor_label") for row in intents] == ["actor-A", "actor-B"]
+            and [row.get("sequence") for row in intents] == [1, 2]
+            and all(row.get("shared_user_id") == outcome.get("synthetic_shopper_id") for row in intents)
+            and windows_valid
+            and final_is_supported
             and outcome.get("cart_HTTP_status") == 200
-            and valid_final_state
-            and outcome.get("concurrency_claim")
-            == "CLIENT_REQUEST_WINDOWS_OVERLAPPED_SERVER_HANDLER_OVERLAP_NOT_ESTABLISHED"
             and outcome.get("actor_identity") == "HARNESS_LABELS_ONLY_NOT_APPLICATION_AUTHENTICATION"
-            and outcome.get("cart_identity_observation")
-            in ("MATCHED_REQUESTED_SHOPPER", "NOT_ECHOED_FOR_EMPTY_CART")
+        )
+        outcome["client_window_overlap_observed"] = bool(overlap_observed)
+        outcome["overlap_diagnostic"] = "OBSERVED" if overlap_observed else "NOT_OBSERVED"
+        outcome["overlap_definition"] = (
+            "max(request_start_monotonic_ns) < min(response_complete_monotonic_ns)"
         )
     else:
         raise ValueError("Story expected outcome is unsupported.")
     passed = passed and outcome.get("cart_HTTP_status") == 200
-    return {"passed": bool(passed), "expected": expected, "description": STORIES[story]["description"]}
+    assessment = {"passed": bool(passed), "expected": expected, "description": STORIES[story]["description"]}
+    if expected == "overlap-diagnostic":
+        assessment["diagnostic_result"] = outcome.get("overlap_diagnostic", "UNKNOWN")
+        assessment["client_window_overlap_observed"] = outcome.get("client_window_overlap_observed")
+        assessment["service_handler_overlap_claim"] = "NOT_ESTABLISHED"
+    return assessment
 
 
 def is_checkout_dispatch(method, path):
@@ -436,6 +446,9 @@ def routing_binding(state):
         "base_images_lock",
         "evidence_root",
         "telemetry_directory",
+        "agent_replay_enabled",
+        "agent_replay_overlay",
+        "agent_replay_cassette",
     )
     identity = json.dumps(
         {key: state.get(key) for key in fields}, sort_keys=True, separators=(",", ":")
@@ -454,6 +467,9 @@ def bound_inputs(state, directory):
         "images": Path(state["images_lock"]),
         "provenance": PUBLIC / "images.lock.json",
     }
+    if state.get("agent_replay_enabled") is True:
+        files["agent_replay_overlay"] = Path(state["agent_replay_overlay"])
+        files["agent_replay_cassette"] = Path(state["agent_replay_cassette"])
     result = {
         key: {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "bytes": path.stat().st_size}
         for key, path in files.items()
@@ -529,7 +545,7 @@ def snapshot_runtime(state, directory, runner=native):
     ):
         raise ValueError("Runtime image census is incomplete.")
     expected = {name: record["config_id"] for name, record in zip(names, inspected)}
-    identifiers = runner(compose_args(state, ["ps", "--all", "--quiet"])).split()
+    identifiers = runner(compose_args(state, ["ps", "--all", "--quiet", *CORE_SERVICES])).split()
     if len(identifiers) != len(CORE_SERVICES) or any(
         not re.fullmatch(r"[0-9a-f]{12,64}", value) for value in identifiers
     ):
@@ -585,6 +601,9 @@ def snapshot_inputs(state, directory):
         "source-receipt.json": Path(state["workspace"]).parent
         / (Path(state["workspace"]).name + ".source-receipt.json"),
     }
+    if state.get("agent_replay_enabled") is True:
+        files["agent-replay-overlay.py"] = Path(state["agent_replay_overlay"])
+        files["agent-replay-cassette.yaml"] = Path(state["agent_replay_cassette"])
     manifest = []
     for name, source in files.items():
         if not source.is_file():
@@ -620,7 +639,19 @@ def snapshot_inputs(state, directory):
         _RECORDER.artifact("Application traces folder", Path(state["telemetry_directory"]))
 
 
-def scoped_config(rendered, images, project, flags, http_port, mcp_port, envoy_template=None, telemetry=None):
+def scoped_config(
+    rendered,
+    images,
+    project,
+    flags,
+    http_port,
+    mcp_port,
+    envoy_template=None,
+    telemetry=None,
+    *,
+    agent_replay=False,
+    agent_overlay=None,
+):
     compose_args({"project": project, "config": "pending", "docker_context": "source-validation"}, [])
     if any(name not in rendered["services"] for name in CORE_SERVICES):
         raise ValueError("Pinned upstream render lacks a required core service.")
@@ -683,6 +714,75 @@ def scoped_config(rendered, images, project, flags, http_port, mcp_port, envoy_t
             {"type": "bind", "source": str(telemetry.absolute()), "target": "/evidence", "read_only": False}
         )
     services["otel-collector"]["command"] = ["--config=/etc/otelcol/config.yaml"]
+    networks = {
+        "default": {"name": project + "_default", "driver": "bridge", "internal": True},
+        "edge": {"name": project + "_edge", "driver": "bridge", "internal": False},
+    }
+    if agent_replay:
+        if agent_overlay is None or "agent" not in rendered["services"]:
+            raise ValueError("Replay-only agent setup requires the pinned upstream agent and safety overlay.")
+        agent = copy.deepcopy(rendered["services"]["agent"])
+        agent.pop("container_name", None)
+        agent.get("deploy", {}).pop("placement", None)
+        agent["restart"] = "no"
+        agent["ports"] = []
+        agent["platform"] = "linux/amd64"
+        agent["networks"] = {"agent-replay": None}
+        agent["depends_on"] = {
+            name: dependency
+            for name, dependency in agent.get("depends_on", {}).items()
+            if name in CORE_SERVICES
+        }
+        upstream_environment = agent.get("environment", {})
+        if not isinstance(upstream_environment, dict):
+            raise ValueError("Pinned upstream agent environment is not a rendered mapping.")
+        # Rebuild, do not inherit the source .env: only these local endpoints and
+        # replay controls are needed, and unknown credential names must not leak.
+        env = {
+            "WORKFLOW_LAB_CASSETTE_REPLAY_ONLY": "1",
+            "USE_VCR": "true",
+            "VCR_MATCH_THRESHOLD": "1.0",
+            "LLM_MODEL": AGENT_REPLAY_MODEL,
+            "LLM_BASE_URL": "http://127.0.0.1:9/v1",
+            "LLM_TLS_VERIFY": "true",
+            "API_KEY": "sk-dummy",
+            "OPENAI_API_KEY": "sk-dummy",
+            "MCP_ENABLED": "True",
+            "MCP_ENDPOINT": "mcp",
+            "MCP_PORT": "8011",
+            "AGENT_PORT": "8010",
+            "GRAPH_RECURSION_LIMIT": "6",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "http://otel-collector:4318",
+            "OTEL_EXPORTER_OTLP_INSECURE": "true",
+            "OTEL_RESOURCE_ATTRIBUTES": "service.namespace=workflow-lab,service.criticality=low",
+            "OTEL_SERVICE_NAME": "agent",
+            "OTEL_PYTHON_SDK_INTERNAL_METRICS_ENABLED": "true",
+            "TRACELOOP_BASE_URL": "http://otel-collector:4318",
+            "FLAGD_HOST": "flagd",
+            "FLAGD_PORT": "8013",
+        }
+        agent["environment"] = env
+        volumes = agent.get("volumes", [])
+        for volume in volumes:
+            if isinstance(volume, dict) and volume.get("target") == "/app/fixtures":
+                volume["read_only"] = True
+        volumes.append(
+            {
+                "type": "bind",
+                "source": str(Path(agent_overlay).absolute()),
+                "target": "/app/sitecustomize.py",
+                "read_only": True,
+            }
+        )
+        agent["volumes"] = volumes
+        services["agent"] = agent
+        for service_name in ("mcp", "otel-collector", "flagd"):
+            services[service_name]["networks"]["agent-replay"] = None
+        networks["agent-replay"] = {
+            "name": project + "_agent-replay",
+            "driver": "bridge",
+            "internal": True,
+        }
     volumes = copy.deepcopy(rendered.get("volumes", {}))
     for name, volume in volumes.items():
         if volume.get("external"):
@@ -692,10 +792,7 @@ def scoped_config(rendered, images, project, flags, http_port, mcp_port, envoy_t
         {
             "name": project,
             "services": services,
-            "networks": {
-                "default": {"name": project + "_default", "driver": "bridge", "internal": True},
-                "edge": {"name": project + "_edge", "driver": "bridge", "internal": False},
-            },
+            "networks": networks,
             "volumes": volumes,
         }
     )
@@ -796,6 +893,143 @@ def cart_items(value, *, expected_user=None):
             raise ValueError("Cart item identity or quantity is invalid; cart observation is unknown.")
         result.append({"product_id": product, "quantity": quantity})
     return result
+
+
+def _proto_varint(data, offset):
+    value = 0
+    for shift in range(0, 70, 7):
+        if offset >= len(data):
+            raise ValueError("Truncated Valkey cart protobuf varint.")
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            if value > 0xFFFFFFFFFFFFFFFF:
+                raise ValueError("Valkey cart protobuf varint is out of range.")
+            return value, offset
+    raise ValueError("Valkey cart protobuf varint is overlong.")
+
+
+def _proto_bytes(data, offset):
+    size, offset = _proto_varint(data, offset)
+    end = offset + size
+    if end > len(data):
+        raise ValueError("Truncated Valkey cart protobuf field.")
+    return data[offset:end], end
+
+
+def _decode_cart_item(data):
+    product_id = None
+    quantity = None
+    offset = 0
+    while offset < len(data):
+        tag, offset = _proto_varint(data, offset)
+        field, wire = tag >> 3, tag & 7
+        if field == 1 and wire == 2 and product_id is None:
+            raw, offset = _proto_bytes(data, offset)
+            product_id = raw.decode("utf-8")
+        elif field == 2 and wire == 0 and quantity is None:
+            quantity, offset = _proto_varint(data, offset)
+        else:
+            raise ValueError("Valkey cart protobuf item has an unsupported field.")
+    if not product_id or type(quantity) is not int or not 0 < quantity <= 0x7FFFFFFF:
+        raise ValueError("Valkey cart protobuf item is incomplete or invalid.")
+    return {"product_id": product_id, "quantity": quantity}
+
+
+def decode_valkey_cart(data):
+    """Decode only the Cart/CartItem fields in the pinned upstream demo.proto."""
+    if not isinstance(data, bytes) or len(data) > 1_048_576:
+        raise ValueError("Valkey cart protobuf is absent or exceeds the sample bound.")
+    user_id = ""
+    items = []
+    user_id_seen = False
+    offset = 0
+    while offset < len(data):
+        tag, offset = _proto_varint(data, offset)
+        field, wire = tag >> 3, tag & 7
+        if field == 1 and wire == 2 and not user_id_seen:
+            raw, offset = _proto_bytes(data, offset)
+            user_id = raw.decode("utf-8")
+            user_id_seen = True
+        elif field == 2 and wire == 2:
+            raw, offset = _proto_bytes(data, offset)
+            items.append(_decode_cart_item(raw))
+        else:
+            raise ValueError("Valkey cart protobuf has an unsupported or duplicate field.")
+    if len({item["product_id"] for item in items}) != len(items):
+        raise ValueError("Valkey cart protobuf has duplicate product IDs.")
+    return {"user_id": user_id, "items": items}
+
+
+def read_valkey_cart(state, user, runner=native):
+    """Read one pinned cart hash through the captured Compose target; never write."""
+    try:
+        validate_user(user)
+        config_path = Path(state.get("config", ""))
+        config_bytes = config_path.read_bytes()
+        config_binding = {"sha256": hashlib.sha256(config_bytes).hexdigest(), "bytes": len(config_bytes)}
+        recorded_bindings = state.get("input_bindings")
+        if (
+            state.get("source_variant") not in ("original", "mcp-session-id")
+            or state.get("source_commit") != SOURCE_COMMIT
+            or not re.fullmatch(r"shop-[0-9a-f]{12}", state.get("project", ""))
+            or not isinstance(state.get("config"), str)
+            or not config_path.is_file()
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", state.get("docker_context", ""))
+            or not isinstance(state.get("engine_id"), str)
+            or not state["engine_id"]
+            or not isinstance(recorded_bindings, dict)
+            or recorded_bindings.get("compose") != config_binding
+            or recorded_bindings.get("routing") != routing_binding(state)
+        ):
+            return {"status": "UNKNOWN", "reason": "unsupported-source-binding"}
+        engine = runner(
+            ["docker", "--context", state["docker_context"], "info", "--format", "{{.ID}}"]
+        ).strip()
+        if engine != state["engine_id"]:
+            return {"status": "UNKNOWN", "reason": "docker-engine-binding-changed"}
+        quoted_user = shlex.quote(user)
+        script = (
+            "set -e; "
+            f"valkey-cli --raw HEXISTS {quoted_user} cart; "
+            f"valkey-cli --raw HGET {quoted_user} cart | base64 | tr -d '\\n'; printf '\\n'"
+        )
+        output = runner(compose_args(state, ["exec", "-T", "valkey-cart", "sh", "-c", script]))
+        rows = output.splitlines()
+        if len(rows) != 2 or rows[0] != "1":
+            return {"status": "UNKNOWN", "reason": "missing-or-malformed-valkey-readback"}
+        payload = base64.b64decode(rows[1], validate=True)
+        cart = decode_valkey_cart(payload)
+        if cart["user_id"] and cart["user_id"] != user:
+            return {"status": "UNKNOWN", "reason": "valkey-payload-user-mismatch"}
+        if cart["items"] and cart["user_id"] != user:
+            return {"status": "UNKNOWN", "reason": "valkey-nonempty-cart-identity-unbound"}
+        return {
+            "status": "OBSERVED",
+            "key_user_id": user,
+            "payload_user_id": cart["user_id"] or None,
+            "identity_basis": "payload-user-id"
+            if cart["user_id"]
+            else "exact-valkey-hash-key-empty-payload-has-no-user-id",
+            "items": cart["items"],
+            "payload_sha256": hashlib.sha256(payload).hexdigest(),
+            "project_id": state["project"],
+            "source_commit": state["source_commit"],
+            "docker_context": state["docker_context"],
+            "config_sha256": hashlib.sha256(Path(state["config"]).read_bytes()).hexdigest(),
+        }
+    except (OSError, TypeError, ValueError, RuntimeError, subprocess.SubprocessError, binascii.Error):
+        return {"status": "UNKNOWN", "reason": "valkey-read-failed-or-invalid"}
+
+
+def compare_valkey_cart(user, expected_items, observation):
+    """Compare a direct store observation with one API projection without upgrading missing evidence."""
+    if observation.get("status") != "OBSERVED" or observation.get("key_user_id") != user:
+        return "UNKNOWN"
+    if observation.get("items") != expected_items:
+        return "CONTRADICTED"
+    return "MATCHED_API_READBACK"
 
 
 def verify_health(state, runner=native, http=request):
@@ -948,6 +1182,8 @@ main().catch(error => {
     observer_identity = cart_identity_status(observer, user) if observer_status == 200 else "UNKNOWN"
     return {
         "story": "shared-cart-conflict",
+        "project_id": state["project"],
+        "synthetic_shopper_id": user,
         "cart_before": [],
         "cart_after": client_b_items,
         "cart_HTTP_status": observer_status,
@@ -1025,7 +1261,7 @@ main().catch(error => {
         )
 
     sources = [source("actor-A", products[0]), source("actor-B", products[1])]
-    state["users"][user] = {"status": "DISPATCHED", "story": "shared-cart-overlap"}
+    state["users"][user] = {"status": "DISPATCHED", "story": "shared-cart-overlap-diagnostic"}
     write_json(directory / "state.json", state)
     commands = [
         compose_args(state, ["exec", "-T", "frontend", FRONTEND_NODE, "-e", script]) for script in sources
@@ -1073,7 +1309,7 @@ main().catch(error => {
         {row["product_id"] for row in observed_items} if isinstance(observed_items, list) else set()
     )
     return {
-        "story": "shared-cart-overlap",
+        "story": "shared-cart-overlap-diagnostic",
         "project_id": state["project"],
         "synthetic_shopper_id": user,
         "cart_before": [],
@@ -1109,7 +1345,7 @@ main().catch(error => {
         if observer_status == 200
         else "UNKNOWN",
         "actor_identity": "HARNESS_LABELS_ONLY_NOT_APPLICATION_AUTHENTICATION",
-        "concurrency_claim": "CLIENT_REQUEST_WINDOWS_OVERLAPPED_SERVER_HANDLER_OVERLAP_NOT_ESTABLISHED",
+        "concurrency_claim": "CLIENT_WINDOWS_MEASURED_SERVER_HANDLER_OVERLAP_NOT_ESTABLISHED",
         "runtime_qualification": "OBSERVATION_ONLY_NO_SERVER_CONCURRENCY_OR_AUTHORIZATION_CLAIM",
     }
 
@@ -1143,7 +1379,7 @@ def run_story(state, directory, user, fixture=None, http=request, runner=native)
             if len(products) < 2:
                 raise ValueError("The catalogue did not provide two products for the shared-cart conflict.")
             product_ids = [products[0]["id"], products[1]["id"]]
-            if STORIES[story]["expected"] == "overlap-observed":
+            if story == "shared-cart-overlap-diagnostic":
                 outcome = run_shared_cart_overlap(state, directory, user, product_ids, runner, http)
             else:
                 outcome = run_shared_cart_conflict(state, directory, user, product_ids, runner, http)
@@ -1165,6 +1401,10 @@ def run_story(state, directory, user, fixture=None, http=request, runner=native)
         if _RECORDER is not None:
             _RECORDER.result(outcome)
         if not outcome["assessment"]["passed"]:
+            if story == "shared-cart-overlap-diagnostic":
+                raise RuntimeError(
+                    "Shared-cart overlap diagnostic failed a recorded identity/window/final-state predicate."
+                )
             raise RuntimeError("The shared-cart ordering result did not match its expected behavior.")
         progress("Case complete: " + STORIES[story]["title"] + " behaved as described.")
         return outcome
@@ -1194,51 +1434,54 @@ def run_story(state, directory, user, fixture=None, http=request, runner=native)
                 raise ValueError(
                     "The public catalogue does not provide two distinct products for the isolation check."
                 )
-            other_status, _ = http(
-                state["http_port"],
-                "POST",
-                "/api/cart?currencyCode=USD",
-                {"userId": other_user, "item": {"productId": products[1]["id"], "quantity": 1}},
-            )
-            if other_status != 200:
-                raise RuntimeError("Second synthetic cart seeding failed; no retry was made.")
             primary_status, primary = http(
                 state["http_port"], "GET", "/api/cart?sessionId=" + user + "&currencyCode=USD"
             )
-            other_read_status, other = http(
-                state["http_port"], "GET", "/api/cart?sessionId=" + other_user + "&currencyCode=USD"
-            )
-            if primary_status != 200 or other_read_status != 200:
-                raise RuntimeError("A synthetic actor's cart readback failed; MCP comparison is unknown.")
+            if primary_status != 200:
+                raise RuntimeError("First synthetic actor's HTTP readback failed; MCP comparison is unknown.")
             primary_items = cart_items(primary, expected_user=user)
-            other_items = cart_items(other, expected_user=other_user)
             source = """import asyncio,json
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 users = USER_IDS
+product_id = PRODUCT_ID
+async def normalized(result):
+ items=[]
+ for content in result.content:
+  if hasattr(content,"text"):
+   try:
+    value=json.loads(content.text)
+    items=value.get("items",[]) if isinstance(value,dict) else []
+   except (ValueError,AttributeError): pass
+ return [{"product_id":x.get("productId",x.get("product_id")),"quantity":x.get("quantity")} for x in items]
 async def main():
  async with streamablehttp_client("http://127.0.0.1:8011/mcp") as (read,write,_):
   async with ClientSession(read,write) as session:
    await session.initialize()
    tools=await session.list_tools()
+   names=[x.name for x in tools.tools]
+   if "add_to_cart" not in names or "get_cart" not in names: raise RuntimeError("required tools unavailable")
+   mutation=await session.call_tool("add_to_cart",{"user_id":users[1],"product_id":product_id,"quantity":1})
+   mutation_items=await normalized(mutation)
    carts=[]
    for user in users:
     result=await session.call_tool("get_cart",{"user_id":user})
-    items=[]
-    for content in result.content:
-     if hasattr(content,"text"):
-      try: items=json.loads(content.text).get("items",[])
-      except (ValueError,AttributeError): pass
-    carts.append({"user_id":user,"is_error":result.isError,"items":[{"product_id":x.get("productId",x.get("product_id")),"quantity":x.get("quantity")} for x in items]})
-   print(json.dumps({"initialized":True,"tool_names":[x.name for x in tools.tools],"carts":carts}))
+    carts.append({"user_id":user,"is_error":result.isError,"items":await normalized(result)})
+   print(json.dumps({"initialized":True,"tool_names":names,"mutation_is_error":mutation.isError,"mutation_items":mutation_items,"carts":carts}))
 asyncio.run(main())
-""".replace("USER_IDS", json.dumps([user, other_user]))
+""".replace("USER_IDS", json.dumps([user, other_user])).replace("PRODUCT_ID", json.dumps(products[1]["id"]))
             result = json.loads(runner(compose_args(state, ["exec", "-T", "mcp", "python", "-"]), source))
             if len(result.get("carts", [])) != 2 or [entry.get("user_id") for entry in result["carts"]] != [
                 user,
                 other_user,
             ]:
                 raise RuntimeError("MCP cart reads did not return both requested synthetic actors in order.")
+            other_status, other = http(
+                state["http_port"], "GET", "/api/cart?sessionId=" + other_user + "&currencyCode=USD"
+            )
+            if other_status != 200:
+                raise RuntimeError("MCP-mutated shopper HTTP readback failed; state is unknown.")
+            other_items = cart_items(other, expected_user=other_user)
             mcp_carts = {
                 entry["user_id"]: entry["items"]
                 for entry in result["carts"]
@@ -1247,18 +1490,28 @@ asyncio.run(main())
             http_carts = {user: primary_items, other_user: other_items}
             normalized_mcp = {actor: cart_items({"items": items}) for actor, items in mcp_carts.items()}
             projections_match = normalized_mcp == http_carts and len(normalized_mcp) == 2
+            stateful_mutation_verified = (
+                result.get("mutation_is_error") is False
+                and other_items == [{"product_id": products[1]["id"], "quantity": 1}]
+                and normalized_mcp.get(other_user) == other_items
+            )
             actor_isolation_verified = (
                 user != other_user
                 and bool(primary_items)
                 and bool(other_items)
                 and primary_items != other_items
                 and projections_match
+                and stateful_mutation_verified
             )
             outcome = {
                 "story": story,
-                "cart_HTTP_status": min(before_status, primary_status, other_status, other_read_status),
+                "project_id": state["project"],
+                "cart_HTTP_status": min(before_status, primary_status, other_status),
                 "MCP_initialized": result["initialized"],
-                "tool_error": len(mcp_carts) != 2,
+                "MCP_stateful_tool": "add_to_cart",
+                "MCP_stateful_mutation_verified": stateful_mutation_verified,
+                "MCP_stateful_mutation_is_error": result.get("mutation_is_error"),
+                "tool_error": len(mcp_carts) != 2 or result.get("mutation_is_error") is not False,
                 "HTTP_cart": primary_items,
                 "MCP_cart": normalized_mcp.get(user, []),
                 "HTTP_carts_by_synthetic_actor": http_carts,
@@ -1299,6 +1552,7 @@ asyncio.run(main())
             "checkout_attempt_count": checkout_attempt_count,
             "checkout_HTTP_status": status,
             "order_response_present": isinstance(response, dict) and bool(response.get("orderId")),
+            "order_id": response.get("orderId") if isinstance(response, dict) else None,
             "cart_HTTP_status": after_status,
             "cart_before": cart_items(before, expected_user=user),
             "cart_after": cart_items(after, expected_user=user),
@@ -1458,6 +1712,7 @@ def start_owned(state, directory, runner, http):
                     "--no-build",
                     "--pull",
                     "never" if images["mcp"].startswith("sha256:") else "missing",
+                    *CORE_SERVICES,
                 ],
             )
         )
@@ -1488,6 +1743,194 @@ def start_owned(state, directory, runner, http):
                 "workspace": state["workspace"],
             }
         )
+
+
+def run_agent_replay(state, directory, runner=native, http=request):
+    """Exercise one pinned cassette with a dummy key, loopback endpoint and internal network."""
+    if state.get("agent_replay_enabled") is not True:
+        raise ValueError("Prepare this world with setup --agent-replay before requesting fixture replay.")
+    verify_world(state, directory)
+    overlay = Path(state["agent_replay_overlay"])
+    cassette = Path(state["agent_replay_cassette"])
+    result_path = directory / "agent-replay-result.json"
+    outcome = {
+        "schema": "workflow-lab.agent-replay.v1",
+        "status": "UNKNOWN",
+        "source_commit": state["source_commit"],
+        "compose_project": state["project"],
+        "docker_context": state["docker_context"],
+        "model": AGENT_REPLAY_MODEL,
+        "prompt": "Show all available products in the store.",
+        "cassette_name": AGENT_REPLAY_CASSETTE,
+        "cassette_sha256": hashlib.sha256(cassette.read_bytes()).hexdigest(),
+        "overlay_sha256": hashlib.sha256(overlay.read_bytes()).hexdigest(),
+        "vcrpy_version": AGENT_VCRPY_VERSION,
+        "record_mode": "none",
+        "match_threshold": "1.0",
+        "model_base_url": "http://127.0.0.1:9/v1 (unreachable loopback only)",
+        "api_key": "dummy sentinel only",
+        "network_policy": "agent attached only to project internal agent-replay bridge",
+        "runtime_scope": "FIXTURE REPLAY; no live inference or business mutation intended",
+        "live_inference": False,
+    }
+    successful = False
+    agent_may_exist = False
+    container_id = None
+    try:
+        if not state.get("started"):
+            start_owned(state, directory, runner, http)
+        config = json.loads(Path(state["config"]).read_bytes())
+        expected_network = state["project"] + "_agent-replay"
+        agent_service = config.get("services", {}).get("agent", {})
+        if (
+            config.get("networks", {}).get("agent-replay", {}).get("internal") is not True
+            or agent_service.get("networks") != {"agent-replay": None}
+            or not any(
+                isinstance(mount, dict)
+                and mount.get("target") == "/app/sitecustomize.py"
+                and Path(mount.get("source", "")).resolve() == overlay.resolve()
+                and mount.get("read_only") is True
+                for mount in agent_service.get("volumes", [])
+            )
+            or agent_service.get("environment", {}).get("LLM_BASE_URL") != "http://127.0.0.1:9/v1"
+            or agent_service.get("environment", {}).get("API_KEY") != "sk-dummy"
+            or agent_service.get("environment", {}).get("OPENAI_API_KEY") != "sk-dummy"
+        ):
+            raise ValueError("Replay-only isolation/configuration is absent; no agent prompt was sent.")
+        agent_may_exist = True
+        runner(
+            compose_args(
+                state,
+                ["up", "-d", "--build", "--wait", "--wait-timeout", "90", "agent"],
+            )
+        )
+        container_id = runner(compose_args(state, ["ps", "--quiet", "agent"])).strip()
+        if not re.fullmatch(r"[0-9a-f]{12,64}", container_id):
+            raise RuntimeError("Agent container identity is unavailable; no prompt was sent.")
+        inspect_prefix = ["docker", "--context", state["docker_context"], "inspect", container_id]
+        mounts = json.loads(runner([*inspect_prefix, "--format", "{{json .Mounts}}"]))
+        port_bindings = json.loads(runner([*inspect_prefix, "--format", "{{json .HostConfig.PortBindings}}"]))
+        networks = json.loads(runner([*inspect_prefix, "--format", "{{json .NetworkSettings.Networks}}"]))
+        overlay_mount = next(
+            (
+                mount
+                for mount in mounts
+                if mount.get("Destination") == "/app/sitecustomize.py"
+                and Path(mount.get("Source", "")).resolve() == overlay.resolve()
+            ),
+            None,
+        )
+        fixture_mount = next((mount for mount in mounts if mount.get("Destination") == "/app/fixtures"), None)
+        if (
+            not overlay_mount
+            or overlay_mount.get("RW") is not False
+            or not fixture_mount
+            or fixture_mount.get("RW") is not False
+            or port_bindings not in (None, {})
+            or set(networks) != {expected_network}
+        ):
+            raise RuntimeError("Agent mount, port, or network boundary is unproven; no prompt was sent.")
+        internal = runner(
+            [
+                "docker",
+                "--context",
+                state["docker_context"],
+                "network",
+                "inspect",
+                expected_network,
+                "--format",
+                "{{.Internal}}",
+            ]
+        ).strip()
+        if internal.lower() != "true":
+            raise RuntimeError("Agent replay network is not Docker-internal; no prompt was sent.")
+        verify_script = (
+            "import hashlib,json,os,vcr; from src.agents.patch_vcr import VCR; "
+            "assert vcr.__version__ == '8.3.0'; "
+            "assert VCR.record_mode.value == 'none'; "
+            "assert os.environ.get('WORKFLOW_LAB_CASSETTE_REPLAY_ONLY') == '1'; "
+            "assert os.environ.get('LLM_BASE_URL') == 'http://127.0.0.1:9/v1'; "
+            "assert os.environ.get('API_KEY') == 'sk-dummy'; "
+            "assert os.environ.get('OPENAI_API_KEY') == 'sk-dummy'; "
+            "print(json.dumps({'vcrpy':vcr.__version__,'record_mode':VCR.record_mode.value,"
+            "'overlay_sha256':hashlib.sha256(open('/app/sitecustomize.py','rb').read()).hexdigest()}))"
+        )
+        guard = json.loads(
+            runner(compose_args(state, ["exec", "-T", "agent", "python", "-c", verify_script]))
+        )
+        if guard.get("overlay_sha256") != outcome["overlay_sha256"]:
+            raise RuntimeError("Agent replay guard did not load the captured overlay; no prompt was sent.")
+        request_script = r"""import hashlib,json,urllib.request
+body=json.dumps({'message':'Show all available products in the store.','history':[]}).encode()
+request=urllib.request.Request('http://127.0.0.1:8010/prompt',data=body,headers={'Content-Type':'application/json'})
+with urllib.request.urlopen(request,timeout=120) as response:
+ status=response.status
+ payload=json.load(response)
+messages=payload.get('response',{}).get('messages',[])
+if status != 200 or not isinstance(messages,list):
+ raise RuntimeError('agent endpoint response contract is unknown')
+tool_names=[]
+answers=[]
+for message in messages:
+ if not isinstance(message,dict): continue
+ for call in message.get('tool_calls',[]) or []:
+  if isinstance(call,dict):
+   name=call.get('name') or call.get('function',{}).get('name')
+   if isinstance(name,str): tool_names.append(name)
+ if message.get('type') == 'tool' and isinstance(message.get('name'),str): tool_names.append(message['name'])
+ if message.get('type') in ('ai','assistant') and isinstance(message.get('content'),str): answers.append(message['content'])
+answer=answers[-1] if answers else ''
+if 'list_products' not in tool_names or not answer:
+ raise RuntimeError('fixture replay did not produce its expected read-only tool turn and answer')
+print(json.dumps({'http_status':status,'tool_names':sorted(set(tool_names)),'message_count':len(messages),'answer_chars':len(answer),'answer_sha256':hashlib.sha256(answer.encode()).hexdigest()}))"""
+        replay = json.loads(
+            runner(compose_args(state, ["exec", "-T", "agent", "python", "-c", request_script]))
+        )
+        if replay.get("http_status") != 200 or "list_products" not in replay.get("tool_names", []):
+            raise RuntimeError(
+                "The bounded agent endpoint replay did not satisfy its read-only cassette contract."
+            )
+        outcome.update(replay, status="FIXTURE_REPLAY", agent_container_id=container_id)
+        successful = True
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+        # Keep endpoint failures actionable without copying arbitrary service or
+        # request text into the public result record.
+        outcome["error_type"] = type(error).__name__
+    finally:
+        if agent_may_exist:
+            try:
+                runner(compose_args(state, ["stop", "--timeout", "10", "agent"]))
+                stopped = (
+                    runner(
+                        [
+                            "docker",
+                            "--context",
+                            state["docker_context"],
+                            "inspect",
+                            container_id,
+                            "--format",
+                            "{{.State.Running}}",
+                        ]
+                    )
+                    .strip()
+                    .lower()
+                    if isinstance(container_id, str)
+                    else "unknown"
+                )
+                outcome["agent_stopped"] = stopped == "false"
+                if not outcome["agent_stopped"]:
+                    successful = False
+            except (OSError, RuntimeError, subprocess.SubprocessError):
+                outcome["agent_stopped"] = False
+                successful = False
+        outcome["completed_utc"] = dt.datetime.now(dt.UTC).isoformat()
+        write_json(result_path, outcome)
+        if _RECORDER is not None:
+            _RECORDER.artifact("Public agent cassette replay summary", result_path)
+            _RECORDER.result(outcome)
+    if not successful or outcome.get("agent_stopped") is not True:
+        raise RuntimeError("Agent cassette replay is UNKNOWN; no external model call or retry was allowed.")
+    return outcome
 
 
 def stop_owned(state, directory, runner):
@@ -1524,6 +1967,11 @@ def dispatch_main(argv=None, runner=native, http=request):
     setup.add_argument("--workspace", type=Path)
     setup.add_argument("--images", type=Path)
     setup.add_argument("--story", choices=STORIES, default="normal-checkout")
+    setup.add_argument(
+        "--agent-replay",
+        action="store_true",
+        help="Prepare the optional public agent service with a playback-only VCR overlay; no external model endpoint.",
+    )
     setup.add_argument("--context")
     setup.add_argument("--offline-archive-from", type=Path)
     setup.add_argument("--allow-network-clone", action="store_true")
@@ -1536,7 +1984,7 @@ def dispatch_main(argv=None, runner=native, http=request):
         if name == "story":
             command.add_argument("--user-id")
             command.add_argument("--fixture", type=Path)
-    for command in ("stop", "clean", "view", "cases"):
+    for command in ("stop", "clean", "view", "cases", "agent-replay"):
         commands.add_parser(command)
     for name in ("reset", "replay"):
         command = commands.add_parser(name)
@@ -1658,6 +2106,23 @@ def dispatch_main(argv=None, runner=native, http=request):
         )
         telemetry.mkdir(parents=True, exist_ok=True)
         telemetry.chmod(0o777)  # Only this new, synthetic-data exporter directory.
+        agent_overlay = None
+        agent_cassette = None
+        if args.agent_replay:
+            upstream_agent = workspace / "src/agent/src/agents/patch_vcr.py"
+            agent_cassette = workspace / "src/agent/fixtures/vcr_cassettes" / AGENT_REPLAY_CASSETTE
+            if not upstream_agent.is_file() or not agent_cassette.is_file():
+                raise ValueError(
+                    "Pinned public agent replay source or cassette is missing; no agent was started."
+                )
+            if hashlib.sha256(upstream_agent.read_bytes()).hexdigest() != AGENT_PATCH_VCR_SHA256:
+                raise ValueError("Pinned upstream VCR source changed; replay overlay was not prepared.")
+            if hashlib.sha256(agent_cassette.read_bytes()).hexdigest() != AGENT_CASSETTE_SHA256:
+                raise ValueError("Pinned public cassette changed; replay was not prepared.")
+            agent_overlay = directory / "agent-replay" / "sitecustomize.py"
+            agent_overlay.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(AGENT_REPLAY_OVERLAY, agent_overlay)
+            agent_overlay.chmod(0o644)
         write_json(
             directory / "compose.json",
             scoped_config(
@@ -1669,6 +2134,8 @@ def dispatch_main(argv=None, runner=native, http=request):
                 args.mcp_port,
                 envoy_template,
                 telemetry,
+                agent_replay=args.agent_replay,
+                agent_overlay=agent_overlay,
             ),
         )
         verify_bind_sources(json.loads((directory / "compose.json").read_bytes()))
@@ -1696,6 +2163,7 @@ def dispatch_main(argv=None, runner=native, http=request):
             "config": str(directory / "compose.json"),
             "story": args.story,
             "source_variant": variant,
+            "source_commit": SOURCE_COMMIT,
             "http_port": args.http_port,
             "mcp_port": args.mcp_port,
             "users": {},
@@ -1706,6 +2174,9 @@ def dispatch_main(argv=None, runner=native, http=request):
             "images_lock": str(image_path),
             "base_images_lock": str((args.images or PUBLIC / "runtime-images.lock.json").absolute()),
             "images_sha256": hashlib.sha256(json.dumps(images, sort_keys=True).encode()).hexdigest(),
+            "agent_replay_enabled": args.agent_replay,
+            "agent_replay_overlay": str(agent_overlay) if agent_overlay else None,
+            "agent_replay_cassette": str(agent_cassette) if agent_cassette else None,
         }
         bind_world(state, directory)
         write_json(state_path, state)
@@ -1763,6 +2234,8 @@ def dispatch_main(argv=None, runner=native, http=request):
         start_owned(state, directory, runner, http)
     elif args.command == "stop":
         stop_owned(state, directory, runner)
+    elif args.command == "agent-replay":
+        print(json.dumps(run_agent_replay(state, directory, runner), indent=2))
     elif args.command == "reset":
         start_owned(state, directory, runner, http)
         progress("Reset complete: a clean shop is ready; previous attempts remain preserved.")

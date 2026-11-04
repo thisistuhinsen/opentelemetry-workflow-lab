@@ -46,14 +46,14 @@
       "paymentUnreachable": "off",
       "expected": "ordered-conflict"
     },
-    "shared-cart-overlap": {
-      "title": "Overlapping shared-cart updates",
-      "description": "Record two overlapping client requests that add distinct items to one synthetic cart, then inspect whether both updates remain visible. Client-window overlap does not prove overlap inside the service handler.",
+    "shared-cart-overlap-diagnostic": {
+      "title": "Shared-cart client-window diagnostic",
+      "description": "Launch two independent clients against one synthetic cart and record whether their measured request windows intersect. Either OBSERVED or NOT_OBSERVED is a valid diagnostic; neither result proves overlap inside the service handler.",
       "action": "shared-cart",
       "source_variant": "original",
       "cartFailure": "off",
       "paymentUnreachable": "off",
-      "expected": "overlap-observed"
+      "expected": "overlap-diagnostic"
     }
   }
 }

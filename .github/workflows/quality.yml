@@ -88,6 +88,8 @@ jobs:
           version: "0.11.6"
           python-version: "3.12"
           enable-cache: false
+      - name: Install pinned Chromium for the real browser checkout
+        run: uv run --no-project --python 3.12 --with playwright==1.64.1 python -m playwright install --with-deps chromium
       - name: Create durable host evidence folder
         run: |
           mkdir -p evidence/ci
@@ -102,10 +104,12 @@ jobs:
         run: uv run --no-project --python 3.12 python -m compileall -q public
       - name: Test CI evidence selection and cleanup controls without Docker
         run: uv run --no-project --python 3.12 python public/ci_smoke.py --self-test
+      - name: Prove pinned agent cassette miss is playback-only
+        run: uv run --no-project --python 3.12 --with vcrpy==8.3.0 --with httpx==0.28.1 python public/ci_smoke.py --agent-vcr-self-test
       - name: Check documented project-local wrapper
         run: ./shop --no-browser cases
       - name: Run every catalog story, fresh reset, and explicit replay
-        run: uv run --no-project --python 3.12 python public/ci_smoke.py
+        run: uv run --no-project --python 3.12 --with playwright==1.64.1 python public/ci_smoke.py --agent-replay
       - name: Preserve stop on failure
         if: always()
         run: uv run --no-project --python 3.12 python public/ci_smoke.py --cleanup
