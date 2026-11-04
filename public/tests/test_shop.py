@@ -660,6 +660,7 @@ class ShopControls(unittest.TestCase):
                     return ""
                 self.assertEqual(args[-3], shop.FRONTEND_NODE)
                 script = args[-1]
+                self.assertIn("error && error.cause", script)
                 user = json.loads(script.split("const userId = ", 1)[1].split(";", 1)[0])
                 actor = "actor-A" if "actor-A" in script else "actor-B"
                 clients.append((actor, user))
@@ -754,6 +755,7 @@ class ShopControls(unittest.TestCase):
                     return ""
                 self.assertEqual(args[-3], shop.FRONTEND_NODE)
                 script = args[-1]
+                self.assertIn("error && error.cause", script)
                 user = json.loads(script.split("const userId = ", 1)[1].split(";", 1)[0])
                 if "actor-A" in script:
                     product = json.loads(script.split("const productId = ", 1)[1].split(";", 1)[0])

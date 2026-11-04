@@ -183,7 +183,8 @@ class FailureSummaryTests(unittest.TestCase):
                 commands = primary / "commands"
                 commands.mkdir(parents=True)
                 (commands / "001.stderr.log").write_text(
-                    'exec: "node": executable file not found in $PATH for shopper@example.test\n',
+                    "TypeError: fetch failed; cause=Error: connect ECONNREFUSED "
+                    "127.0.0.1:8080 for shopper@example.test\n",
                     encoding="utf-8",
                 )
                 ci_smoke.write_json(
@@ -211,8 +212,8 @@ class FailureSummaryTests(unittest.TestCase):
 
             output = stderr.getvalue()
             self.assertIn(
-                'Shop CI detail: phase=story status=failed error=exec: "node": '
-                "executable file not found in $PATH for [email]",
+                "Shop CI detail: phase=story status=failed error=TypeError: fetch failed; "
+                "cause=Error: connect ECONNREFUSED 127.0.0.1:8080 for [email]",
                 output,
             )
             self.assertNotIn("shopper@example.test", output)

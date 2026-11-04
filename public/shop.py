@@ -826,7 +826,11 @@ async function main() {
   process.stdout.write(JSON.stringify({actor_label: 'actor-A', intent: 'retain-added-item', status: response.status,
     raw_response: raw, raw_response_sha256: crypto.createHash('sha256').update(raw).digest('hex')}) + '\\n');
 }
-main().catch(error => { console.error(String(error)); process.exitCode = 1; });
+main().catch(error => {
+  const cause = error && error.cause ? `; cause=${String(error.cause)}` : '';
+  console.error(`${String(error)}${cause}`);
+  process.exitCode = 1;
+});
 """.replace("USER_ID", json.dumps(user)).replace("PRODUCT_ID", json.dumps(product[0]))
     state["users"][user] = {"status": "DISPATCHED", "story": "shared-cart-conflict"}
     write_json(directory / "state.json", state)
@@ -862,7 +866,11 @@ async function main() {
   const read = await record(await fetch('http://127.0.0.1:8080/api/cart?sessionId=' + encodeURIComponent(userId) + '&currencyCode=USD'));
   process.stdout.write(JSON.stringify({actor_label: 'actor-B', intent: 'clear-shared-cart', delete: deleted, read}) + '\\n');
 }
-main().catch(error => { console.error(String(error)); process.exitCode = 1; });
+main().catch(error => {
+  const cause = error && error.cause ? `; cause=${String(error.cause)}` : '';
+  console.error(`${String(error)}${cause}`);
+  process.exitCode = 1;
+});
 """.replace("USER_ID", json.dumps(user))
     actor_b = json.loads(
         runner(compose_args(state, ["exec", "-T", "frontend", FRONTEND_NODE, "-e", actor_b_source]))
