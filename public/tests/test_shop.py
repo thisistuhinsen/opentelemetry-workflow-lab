@@ -1189,6 +1189,50 @@ class ShopControls(unittest.TestCase):
             self.assertEqual([x for x in requests if x[0] == "DELETE"], [])
             self.assertTrue(all(args[:3] == ["docker", "--context", "captured-engine"] for args in natives))
 
+    def test_fresh_world_carries_only_prepared_agent_replay_configuration(self):
+        shop = self.module()
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            state = {
+                "agent_replay_enabled": True,
+                "docker_context": "captured-engine",
+                "http_port": 18080,
+                "mcp_port": 18011,
+                "source_variant": "original",
+                "workspace": str(base / "source"),
+                "base_images_lock": str(base / "images.json"),
+            }
+            prepared = shop.fresh_world_setup_args(base, state, "normal-checkout")
+            self.assertIn("--agent-replay", prepared)
+            self.assertEqual(prepared[prepared.index("--context") + 1], "captured-engine")
+            self.assertEqual(prepared[prepared.index("--workspace") + 1], str(base / "source"))
+
+            state["agent_replay_enabled"] = False
+            unprepared = shop.fresh_world_setup_args(base, state, "normal-checkout")
+            self.assertNotIn("--agent-replay", unprepared)
+
+            state["agent_replay_enabled"] = True
+            variant_change = shop.fresh_world_setup_args(base, state, "mcp-session-id")
+            self.assertIn("--agent-replay", variant_change)
+            self.assertNotIn("--workspace", variant_change)
+            self.assertNotIn("--images", variant_change)
+
+            # The catalog moves original -> MCP-derived -> original. Replay
+            # intent persists, while each variant transition gets fresh inputs.
+            current = dict(state)
+            for story in ("normal-checkout", "mcp-session-id", "shared-cart-conflict"):
+                args = shop.fresh_world_setup_args(base, current, story)
+                self.assertIn("--agent-replay", args)
+                current = {
+                    "agent_replay_enabled": "--agent-replay" in args,
+                    "source_variant": shop.STORIES[story]["source_variant"],
+                    "docker_context": state["docker_context"],
+                    "http_port": state["http_port"],
+                    "mcp_port": state["mcp_port"],
+                    "workspace": state["workspace"],
+                    "base_images_lock": state["base_images_lock"],
+                }
+
 
 if __name__ == "__main__":
     unittest.main()

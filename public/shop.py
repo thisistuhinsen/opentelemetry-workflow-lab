@@ -2264,6 +2264,34 @@ def stop_owned(state, directory, runner):
     print("Your shop is stopped; its data and previous attempt records are retained.")
 
 
+def fresh_world_setup_args(base, state, selected):
+    """Carry only explicitly prepared, reusable inputs into a fresh project."""
+    setup_args = ["--state-dir", str(base / "worlds" / uuid.uuid4().hex), "setup", "--story", selected]
+    if not state:
+        return setup_args
+    setup_args += [
+        "--context",
+        state["docker_context"],
+        "--http-port",
+        str(state["http_port"]),
+        "--mcp-port",
+        str(state["mcp_port"]),
+    ]
+    if state["source_variant"] == STORIES[selected]["source_variant"]:
+        setup_args += [
+            "--workspace",
+            state["workspace"],
+            "--images",
+            state.get("base_images_lock", str(PUBLIC / "runtime-images.lock.json")),
+        ]
+    # Agent replay is a campaign-level opt-in. A source-variant transition gets
+    # a fresh default workspace, then setup re-verifies the pinned VCR source
+    # and cassette before creating its isolated service configuration.
+    if state.get("agent_replay_enabled") is True:
+        setup_args.append("--agent-replay")
+    return setup_args
+
+
 def dispatch_main(argv=None, runner=native, http=request):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, default=PUBLIC.parent / ".shop")
@@ -2503,25 +2531,9 @@ def dispatch_main(argv=None, runner=native, http=request):
             raise ValueError(
                 "Replay requires a fresh synthetic shopper; old checkout intent is never retried."
             )
-        relative = "worlds/" + uuid.uuid4().hex
+        setup_args = fresh_world_setup_args(base, state, selected)
+        relative = Path(setup_args[1]).relative_to(base).as_posix()
         new_directory = base / relative
-        setup_args = ["--state-dir", str(new_directory), "setup", "--story", selected]
-        if state:
-            setup_args += [
-                "--context",
-                state["docker_context"],
-                "--http-port",
-                str(state["http_port"]),
-                "--mcp-port",
-                str(state["mcp_port"]),
-            ]
-            if state["source_variant"] == STORIES[selected]["source_variant"]:
-                setup_args += [
-                    "--workspace",
-                    state["workspace"],
-                    "--images",
-                    state.get("base_images_lock", str(PUBLIC / "runtime-images.lock.json")),
-                ]
         main(setup_args, runner, http)
         if state:
             # Failed health must not prevent a fresh owned reset.
