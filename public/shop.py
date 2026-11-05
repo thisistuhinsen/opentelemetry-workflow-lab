@@ -1854,6 +1854,15 @@ AGENT_RUNTIME_GUARD_CHECKS = {
     "overlay-digest",
     "guard-response",
 }
+AGENT_ENDPOINT_CHECKS = {
+    "http-readiness",
+    "http-readiness-contract",
+    "http-request",
+    "response-json",
+    "response-contract",
+    "read-only-tool-turn",
+    "endpoint-response",
+}
 
 
 def agent_replay_failure_message(outcome, last_stage):
@@ -1877,6 +1886,14 @@ def agent_replay_failure_message(outcome, last_stage):
     guard_error_type = outcome.get("runtime_guard_error_type")
     if isinstance(guard_error_type, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", guard_error_type):
         diagnostic["runtime_guard_error_type"] = guard_error_type
+    endpoint_check = outcome.get("endpoint_check")
+    if isinstance(endpoint_check, str) and endpoint_check in AGENT_ENDPOINT_CHECKS:
+        diagnostic["endpoint_check"] = endpoint_check
+    endpoint_error_type = outcome.get("endpoint_error_type")
+    if isinstance(endpoint_error_type, str) and re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9]{0,63}", endpoint_error_type
+    ):
+        diagnostic["endpoint_error_type"] = endpoint_error_type
     if type(outcome.get("agent_stopped")) is bool:
         diagnostic["agent_stopped"] = outcome["agent_stopped"]
     return (
@@ -1892,7 +1909,11 @@ def agent_runtime_guard_failure(guard, expected_overlay_sha256):
     if guard.get("status") != "PASS":
         check = guard.get("failed_check")
         error_type = guard.get("error_type")
-        failure = {"runtime_guard_check": check if check in AGENT_RUNTIME_GUARD_CHECKS else "guard-response"}
+        failure = {
+            "runtime_guard_check": check
+            if isinstance(check, str) and check in AGENT_RUNTIME_GUARD_CHECKS
+            else "guard-response"
+        }
         if isinstance(error_type, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", error_type):
             failure["runtime_guard_error_type"] = error_type
         return failure
@@ -1902,6 +1923,33 @@ def agent_runtime_guard_failure(guard, expected_overlay_sha256):
         return {"runtime_guard_check": "vcr-record-mode"}
     if guard.get("overlay_sha256") != expected_overlay_sha256:
         return {"runtime_guard_check": "overlay-digest"}
+    return None
+
+
+def agent_endpoint_failure(result, expected_status):
+    """Return only a known endpoint check and exception class from a bounded probe."""
+    if not isinstance(result, dict):
+        return {"endpoint_check": "endpoint-response"}
+    if result.get("status") != expected_status:
+        check = result.get("failed_check")
+        failure = {
+            "endpoint_check": check
+            if isinstance(check, str) and check in AGENT_ENDPOINT_CHECKS
+            else "endpoint-response"
+        }
+        error_type = result.get("error_type")
+        if isinstance(error_type, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", error_type):
+            failure["endpoint_error_type"] = error_type
+        return failure
+    if expected_status == "READY" and (result.get("method"), result.get("path")) != ("POST", "/prompt"):
+        return {"endpoint_check": "http-readiness-contract"}
+    tool_names = result.get("tool_names")
+    if expected_status == "PASS" and (
+        result.get("http_status") != 200
+        or not isinstance(tool_names, list)
+        or "list_products" not in tool_names
+    ):
+        return {"endpoint_check": "endpoint-response"}
     return None
 
 
@@ -2054,37 +2102,80 @@ except Exception as error:
         if guard_failure:
             outcome.update(guard_failure)
             raise RuntimeError("Agent replay runtime guard is UNKNOWN; no prompt was sent.")
+        outcome.pop("runtime_guard_check", None)
         mark_stage("fixture-endpoint")
-        request_script = r"""import hashlib,json,urllib.request
-body=json.dumps({'message':'Show all available products in the store.','history':[]}).encode()
-request=urllib.request.Request('http://127.0.0.1:8010/prompt',data=body,headers={'Content-Type':'application/json'})
-with urllib.request.urlopen(request,timeout=120) as response:
- status=response.status
- payload=json.load(response)
-messages=payload.get('response',{}).get('messages',[])
-if status != 200 or not isinstance(messages,list):
- raise RuntimeError('agent endpoint response contract is unknown')
-tool_names=[]
-answers=[]
-for message in messages:
- if not isinstance(message,dict): continue
- for call in message.get('tool_calls',[]) or []:
-  if isinstance(call,dict):
-   name=call.get('name') or call.get('function',{}).get('name')
-   if isinstance(name,str): tool_names.append(name)
- if message.get('type') == 'tool' and isinstance(message.get('name'),str): tool_names.append(message['name'])
- if message.get('type') in ('ai','assistant') and isinstance(message.get('content'),str): answers.append(message['content'])
-answer=answers[-1] if answers else ''
-if 'list_products' not in tool_names or not answer:
- raise RuntimeError('fixture replay did not produce its expected read-only tool turn and answer')
-print(json.dumps({'http_status':status,'tool_names':sorted(set(tool_names)),'message_count':len(messages),'answer_chars':len(answer),'answer_sha256':hashlib.sha256(answer.encode()).hexdigest()}))"""
+        readiness_script = r"""import json,time,urllib.request
+deadline=time.monotonic()+60
+check='http-readiness'
+last_error='TimeoutError'
+while time.monotonic() < deadline:
+ try:
+  with urllib.request.urlopen('http://127.0.0.1:8010/openapi.json',timeout=2) as response:
+   check='http-readiness-contract'
+   if response.status != 200: raise RuntimeError
+   raw=response.read(1048577)
+   if len(raw) > 1048576: raise RuntimeError
+   spec=json.loads(raw)
+   if not isinstance(spec.get('paths',{}).get('/prompt',{}).get('post'),dict): raise RuntimeError
+   print(json.dumps({'status':'READY','method':'POST','path':'/prompt'}))
+   break
+ except Exception as error:
+  last_error=type(error).__name__
+  time.sleep(0.5)
+else:
+ print(json.dumps({'status':'UNKNOWN','failed_check':check,'error_type':last_error}))"""
+        try:
+            readiness = json.loads(
+                runner(
+                    compose_args(
+                        state,
+                        ["exec", "-T", "agent", "python", "-c", readiness_script],
+                    )
+                )
+            )
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+            outcome["endpoint_check"] = "http-readiness"
+            outcome["endpoint_error_type"] = type(error).__name__
+            raise RuntimeError("The agent prompt endpoint did not become ready; no prompt was sent.")
+        readiness_failure = agent_endpoint_failure(readiness, "READY")
+        if readiness_failure:
+            outcome.update(readiness_failure)
+            raise RuntimeError("The agent prompt endpoint readiness is UNKNOWN; no prompt was sent.")
+        request_script = r"""import hashlib,json,urllib.error,urllib.request
+check='http-request'
+try:
+ body=json.dumps({'message':'Show all available products in the store.','history':[]}).encode()
+ request=urllib.request.Request('http://127.0.0.1:8010/prompt',data=body,headers={'Content-Type':'application/json'})
+ with urllib.request.urlopen(request,timeout=120) as response:
+  status=response.status
+  check='response-json'
+  payload=json.load(response)
+ check='response-contract'
+ messages=payload.get('response',{}).get('messages',[])
+ if status != 200 or not isinstance(messages,list): raise RuntimeError
+ tool_names=[]
+ answers=[]
+ for message in messages:
+  if not isinstance(message,dict): continue
+  for call in message.get('tool_calls',[]) or []:
+   if isinstance(call,dict):
+    name=call.get('name') or call.get('function',{}).get('name')
+    if isinstance(name,str): tool_names.append(name)
+  if message.get('type') == 'tool' and isinstance(message.get('name'),str): tool_names.append(message['name'])
+  if message.get('type') in ('ai','assistant') and isinstance(message.get('content'),str): answers.append(message['content'])
+ check='read-only-tool-turn'
+ answer=answers[-1] if answers else ''
+ if 'list_products' not in tool_names or not answer: raise RuntimeError
+ print(json.dumps({'status':'PASS','http_status':status,'tool_names':sorted(set(tool_names)),'message_count':len(messages),'answer_chars':len(answer),'answer_sha256':hashlib.sha256(answer.encode()).hexdigest()}))
+except Exception as error:
+ print(json.dumps({'status':'UNKNOWN','failed_check':check,'error_type':type(error).__name__}))"""
         replay = json.loads(
             runner(compose_args(state, ["exec", "-T", "agent", "python", "-c", request_script]))
         )
-        if replay.get("http_status") != 200 or "list_products" not in replay.get("tool_names", []):
-            raise RuntimeError(
-                "The bounded agent endpoint replay did not satisfy its read-only cassette contract."
-            )
+        endpoint_failure = agent_endpoint_failure(replay, "PASS")
+        if endpoint_failure:
+            outcome.update(endpoint_failure)
+            raise RuntimeError("The bounded agent endpoint replay is UNKNOWN.")
         outcome.update(replay, status="FIXTURE_REPLAY", agent_container_id=container_id)
         successful = True
     except Exception as error:

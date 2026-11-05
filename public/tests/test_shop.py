@@ -115,6 +115,68 @@ class ShopControls(unittest.TestCase):
             {"runtime_guard_check": "vcr-record-mode"},
         )
 
+    def test_agent_endpoint_readiness_and_replay_diagnostics_are_bounded(self):
+        shop = self.module()
+        self.assertIsNone(
+            shop.agent_endpoint_failure(
+                {"status": "READY", "method": "POST", "path": "/prompt"},
+                "READY",
+            )
+        )
+        self.assertEqual(
+            shop.agent_endpoint_failure(
+                {
+                    "status": "UNKNOWN",
+                    "failed_check": "http-readiness",
+                    "error_type": "URLError",
+                    "detail": "private prompt and secret",
+                },
+                "READY",
+            ),
+            {"endpoint_check": "http-readiness", "endpoint_error_type": "URLError"},
+        )
+        self.assertEqual(
+            shop.agent_endpoint_failure(
+                {"status": "READY", "method": "POST", "path": "/other"},
+                "READY",
+            ),
+            {"endpoint_check": "http-readiness-contract"},
+        )
+        self.assertEqual(
+            shop.agent_endpoint_failure(
+                {"status": "PASS", "http_status": 200, "tool_names": ["list_products"]},
+                "PASS",
+            ),
+            None,
+        )
+        self.assertEqual(
+            shop.agent_endpoint_failure(
+                {"status": "PASS", "http_status": 200, "tool_names": None},
+                "PASS",
+            ),
+            {"endpoint_check": "endpoint-response"},
+        )
+        self.assertEqual(
+            shop.agent_endpoint_failure(
+                {"status": "UNKNOWN", "failed_check": {"untrusted": True}},
+                "PASS",
+            ),
+            {"endpoint_check": "endpoint-response"},
+        )
+        message = shop.agent_replay_failure_message(
+            {
+                "failure_stage": "fixture-endpoint",
+                "endpoint_check": "http-readiness",
+                "endpoint_error_type": "URLError",
+                "prompt": "private prompt and secret",
+            },
+            "runtime-guard",
+        )
+        self.assertIn('"endpoint_check":"http-readiness"', message)
+        self.assertIn('"endpoint_error_type":"URLError"', message)
+        self.assertNotIn("private prompt", message)
+        self.assertNotIn("secret", message)
+
     def test_setup_makes_only_public_mounted_flags_guest_readable(self):
         shop = self.module()
         with tempfile.TemporaryDirectory() as temporary:

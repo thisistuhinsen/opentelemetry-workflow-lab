@@ -991,6 +991,14 @@ def campaign_failure_diagnostic(summary, phase):
         guard_error_type = agent.get("runtime_guard_error_type")
         if isinstance(guard_error_type, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", guard_error_type):
             agent_detail["runtime_guard_error_type"] = guard_error_type
+        endpoint_check = agent.get("endpoint_check")
+        if isinstance(endpoint_check, str) and endpoint_check in shop_app.AGENT_ENDPOINT_CHECKS:
+            agent_detail["endpoint_check"] = endpoint_check
+        endpoint_error_type = agent.get("endpoint_error_type")
+        if isinstance(endpoint_error_type, str) and re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9]{0,63}", endpoint_error_type
+        ):
+            agent_detail["endpoint_error_type"] = endpoint_error_type
         if type(agent.get("agent_stopped")) is bool:
             agent_detail["agent_stopped"] = agent["agent_stopped"]
         if agent_detail:
@@ -1082,6 +1090,14 @@ def agent_replay_failure_diagnostic(evidence, prior_runs):
     guard_error_type = result.get("runtime_guard_error_type")
     if isinstance(guard_error_type, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", guard_error_type):
         diagnostic["runtime_guard_error_type"] = guard_error_type
+    endpoint_check = result.get("endpoint_check")
+    if isinstance(endpoint_check, str) and endpoint_check in shop_app.AGENT_ENDPOINT_CHECKS:
+        diagnostic["endpoint_check"] = endpoint_check
+    endpoint_error_type = result.get("endpoint_error_type")
+    if isinstance(endpoint_error_type, str) and re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9]{0,63}", endpoint_error_type
+    ):
+        diagnostic["endpoint_error_type"] = endpoint_error_type
     if type(result.get("agent_stopped")) is bool:
         diagnostic["agent_stopped"] = result["agent_stopped"]
     return diagnostic
@@ -1994,6 +2010,8 @@ def self_test():
                     "cleanup_error_type": "AgentStopUnconfirmed",
                     "cleanup_failure_stage": "agent-stop",
                     "agent_stopped": False,
+                    "endpoint_check": "http-readiness",
+                    "endpoint_error_type": "URLError",
                     "prompt": secret,
                     "api_key": secret,
                 },
@@ -2008,6 +2026,8 @@ def self_test():
                     "cleanup_error_type": "AgentStopUnconfirmed",
                     "cleanup_failure_stage": "agent-stop",
                     "agent_stopped": False,
+                    "endpoint_check": "http-readiness",
+                    "endpoint_error_type": "URLError",
                 },
             )
             published = campaign_failure_diagnostic(
@@ -2022,6 +2042,8 @@ def self_test():
                     "cleanup_error_type": "AgentStopUnconfirmed",
                     "cleanup_failure_stage": "agent-stop",
                     "agent_stopped": False,
+                    "endpoint_check": "http-readiness",
+                    "endpoint_error_type": "URLError",
                 },
             )
             self.assertNotIn(secret, encoded)
@@ -2665,55 +2687,6 @@ def main(argv=None):
         failure_phase = "service-start"
         campaign.cli("start", next(iter(catalog)))
 
-        if args.agent_replay:
-            failure_phase = "agent-fixture-replay"
-            summary["agent_replay"] = {"status": "RUNNING"}
-            write_json(campaign.receipts / "campaign.json", summary)
-            agent_replay_prior_runs = set((campaign.evidence / "runs").glob("*/run.json"))
-            try:
-                prior_runs = run_agent_replay_command(campaign)
-            except Exception:
-                summary["agent_replay"] = agent_replay_failure_diagnostic(
-                    campaign.evidence, agent_replay_prior_runs
-                )
-                write_json(campaign.receipts / "campaign.json", summary)
-                raise
-            new_runs = {
-                path
-                for path in set((campaign.evidence / "runs").glob("*/run.json")) - prior_runs
-                if read_json(path).get("command") == "agent-replay"
-            }
-            if len(new_runs) != 1:
-                raise RuntimeError("The agent fixture replay did not produce one durable command result.")
-            run_path = new_runs.pop()
-            agent_run = read_json(run_path)
-            agent_result = read_json(run_path.parent / "result.json")
-            if not validate_agent_replay_result(
-                agent_run,
-                agent_result,
-                expected_overlay_sha256=sha256(shop_app.AGENT_REPLAY_OVERLAY),
-            ):
-                raise RuntimeError(
-                    "The agent endpoint result did not prove the pinned read-only fixture replay."
-                )
-            summary["agent_replay"] = {
-                "status": "FIXTURE_REPLAY",
-                "run": str(run_path.relative_to(campaign.evidence)),
-                "run_sha256": sha256(run_path),
-                "result_sha256": sha256(run_path.parent / "result.json"),
-                "source_commit": agent_result["source_commit"],
-                "model": agent_result["model"],
-                "cassette_sha256": agent_result["cassette_sha256"],
-                "overlay_sha256": agent_result["overlay_sha256"],
-                "vcrpy_version": agent_result["vcrpy_version"],
-                "record_mode": agent_result["record_mode"],
-                "match_threshold": agent_result["match_threshold"],
-                "tool_names": agent_result["tool_names"],
-                "agent_stopped": True,
-                "live_inference": False,
-            }
-            write_json(campaign.receipts / "campaign.json", summary)
-
         def mark_browser_dispatch(user):
             state = active_state(campaign.state)
             if state.get("users", {}).get(user, {}).get("status") != "PREPARED_NO_CHECKOUT":
@@ -2800,7 +2773,58 @@ def main(argv=None):
             if set(previous.get("users", {})) & set(replay.get("users", {})):
                 raise RuntimeError("Explicit replay reused the first story shopper.")
             write_json(campaign.receipts / "campaign.json", summary)
-        success = True
+        agent_replay_succeeded = not args.agent_replay
+        if args.agent_replay:
+            failure_phase = "agent-fixture-replay"
+            summary["agent_replay"] = {"status": "RUNNING"}
+            write_json(campaign.receipts / "campaign.json", summary)
+            agent_replay_prior_runs = set((campaign.evidence / "runs").glob("*/run.json"))
+            try:
+                prior_runs = run_agent_replay_command(campaign)
+                new_runs = {
+                    path
+                    for path in set((campaign.evidence / "runs").glob("*/run.json")) - prior_runs
+                    if read_json(path).get("command") == "agent-replay"
+                }
+                if len(new_runs) != 1:
+                    raise RuntimeError("The agent fixture replay did not produce one durable command result.")
+                run_path = new_runs.pop()
+                agent_run = read_json(run_path)
+                agent_result = read_json(run_path.parent / "result.json")
+                if not validate_agent_replay_result(
+                    agent_run,
+                    agent_result,
+                    expected_overlay_sha256=sha256(shop_app.AGENT_REPLAY_OVERLAY),
+                ):
+                    raise RuntimeError(
+                        "The agent endpoint result did not prove the pinned read-only fixture replay."
+                    )
+                summary["agent_replay"] = {
+                    "status": "FIXTURE_REPLAY",
+                    "run": str(run_path.relative_to(campaign.evidence)),
+                    "run_sha256": sha256(run_path),
+                    "result_sha256": sha256(run_path.parent / "result.json"),
+                    "source_commit": agent_result["source_commit"],
+                    "model": agent_result["model"],
+                    "cassette_sha256": agent_result["cassette_sha256"],
+                    "overlay_sha256": agent_result["overlay_sha256"],
+                    "vcrpy_version": agent_result["vcrpy_version"],
+                    "record_mode": agent_result["record_mode"],
+                    "match_threshold": agent_result["match_threshold"],
+                    "tool_names": agent_result["tool_names"],
+                    "agent_stopped": True,
+                    "live_inference": False,
+                }
+                agent_replay_succeeded = True
+            except Exception:
+                summary["agent_replay"] = agent_replay_failure_diagnostic(
+                    campaign.evidence, agent_replay_prior_runs
+                )
+                agent_replay_succeeded = False
+                write_json(campaign.receipts / "campaign.json", summary)
+                raise RuntimeError("Agent fixture replay is UNKNOWN; no external call was allowed.")
+            write_json(campaign.receipts / "campaign.json", summary)
+        success = agent_replay_succeeded
     except Exception as error:
         if isinstance(error, BrowserCheckoutFailure):
             failure_phase = "browser-" + error.phase
