@@ -15,6 +15,19 @@ import ci_smoke  # noqa: E402
 
 
 class FailureSummaryTests(unittest.TestCase):
+    def test_malformed_agent_selection_failure_is_omitted_from_summary(self):
+        diagnostic = ci_smoke.campaign_failure_diagnostic(
+            {
+                "stories": [],
+                "agent_replay": {
+                    "status": "UNKNOWN",
+                    "selection_failure": {"untrusted": "value"},
+                },
+            },
+            "agent-fixture-replay",
+        )
+        self.assertNotIn("selection_failure", diagnostic.get("agent_replay_diagnostic", {}))
+
     def test_detail_is_bounded_and_scrubs_common_sensitive_values(self):
         detail = ci_smoke.safe_failure_detail(
             "bad checkout for shopper@example.test card 4111111111111111 "

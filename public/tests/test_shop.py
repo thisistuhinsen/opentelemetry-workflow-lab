@@ -10,7 +10,9 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -369,6 +371,349 @@ class ShopControls(unittest.TestCase):
                 shop.agent_replay_summary_path(state, state_dir, root)
             with self.assertRaises(ValueError):
                 shop.agent_replay_summary_path({"project": "../escape"}, state_dir, root)
+
+    def test_agent_replay_top_level_recorder_is_selected_by_campaign(self):
+        shop = self.module()
+        import ci_smoke
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            evidence = root / "evidence"
+            state.mkdir()
+            evidence.mkdir()
+            state_file = state / "state.json"
+            ci_smoke.write_json(state_file, {"agent_replay_enabled": True, "project": "shop-0123456789ab"})
+            campaign = ci_smoke.Campaign(state, evidence)
+            stale_id = str(uuid.uuid4())
+            stale = evidence / "runs" / stale_id / "run.json"
+            ci_smoke.write_json(stale, {"run_id": stale_id, "command": "agent-replay", "status": "passed"})
+            ci_smoke.write_json(stale.parent / "result.json", {"status": "FIXTURE_REPLAY"})
+            replay_result = {
+                "status": "FIXTURE_REPLAY",
+                "source_commit": shop.SOURCE_COMMIT,
+                "model": shop.AGENT_REPLAY_MODEL,
+                "prompt": "Show all available products in the store.",
+                "cassette_sha256": shop.AGENT_CASSETTE_SHA256,
+                "overlay_sha256": hashlib.sha256(shop.AGENT_REPLAY_OVERLAY.read_bytes()).hexdigest(),
+                "vcrpy_version": shop.AGENT_VCRPY_VERSION,
+                "record_mode": "none",
+                "match_threshold": "1.0",
+                "tool_names": ["list_products"],
+                "agent_stopped": True,
+                "live_inference": False,
+            }
+
+            def dispatch(argv, runner, http, parsed_args=None):
+                self.assertEqual(parsed_args.command, "agent-replay")
+                shop._RECORDER.result(replay_result)
+                return 0
+
+            def subprocess_run(argv, **kwargs):
+                return_code = shop.main(argv[2:])
+                return types.SimpleNamespace(returncode=return_code)
+
+            with (
+                mock.patch.object(shop, "dispatch_main", side_effect=dispatch),
+                mock.patch.object(ci_smoke.subprocess, "run", side_effect=subprocess_run),
+            ):
+                before = ci_smoke.run_agent_replay_command(campaign)
+
+            run_path, run_record, result_record = ci_smoke.select_new_agent_replay_record(evidence, before)
+            self.assertNotEqual(run_path, stale)
+            run_record = ci_smoke.read_json(run_path)
+            self.assertEqual(run_record["command"], "agent-replay")
+            self.assertTrue(
+                ci_smoke.validate_agent_replay_result(
+                    run_record,
+                    result_record,
+                    expected_overlay_sha256=replay_result["overlay_sha256"],
+                )
+            )
+
+            duplicate_id = str(uuid.uuid4())
+            duplicate = evidence / "runs" / duplicate_id / "run.json"
+            ci_smoke.write_json(
+                duplicate, {"run_id": duplicate_id, "command": "agent-replay", "status": "passed"}
+            )
+            ci_smoke.write_json(duplicate.parent / "result.json", replay_result)
+            with self.assertRaisesRegex(ci_smoke.AgentReplaySelectionError, "selection is UNKNOWN") as caught:
+                ci_smoke.select_new_agent_replay_record(evidence, before)
+            self.assertEqual(caught.exception.reason, "run-record-count")
+
+            copied_stale_id = str(uuid.uuid4())
+            copied_stale = evidence / "runs" / copied_stale_id / "run.json"
+            ci_smoke.write_json(
+                copied_stale,
+                {"run_id": stale_id, "command": "agent-replay", "status": "passed"},
+            )
+            ci_smoke.write_json(copied_stale.parent / "result.json", replay_result)
+            with self.assertRaises(ci_smoke.AgentReplaySelectionError) as caught:
+                ci_smoke.select_new_agent_replay_record(evidence, before)
+            self.assertEqual(caught.exception.reason, "run-record-identity")
+            bounded = ci_smoke.campaign_failure_diagnostic(
+                {
+                    "stories": [],
+                    "agent_replay": {
+                        "status": "UNKNOWN",
+                        "selection_failure": caught.exception.reason,
+                    },
+                },
+                "agent-fixture-replay",
+            )
+            self.assertEqual(
+                bounded["agent_replay_diagnostic"],
+                {"selection_failure": "run-record-identity"},
+            )
+
+    def test_agent_replay_selection_rejects_uncontained_or_oversized_records(self):
+        import ci_smoke
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence = root / "evidence"
+            outside = root / "outside.json"
+            evidence.mkdir()
+            outside.write_text('{"command":"agent-replay"}\n', encoding="utf-8")
+            run_id = str(uuid.uuid4())
+            symlink_run = evidence / "runs" / run_id / "run.json"
+            symlink_run.parent.mkdir(parents=True)
+            try:
+                symlink_run.symlink_to(outside)
+            except (NotImplementedError, OSError):
+                symlink_supported = False
+            else:
+                symlink_supported = True
+            if symlink_supported:
+                with self.assertRaises(ci_smoke.AgentReplaySelectionError) as caught:
+                    ci_smoke.select_new_agent_replay_record(evidence, set())
+                self.assertEqual(caught.exception.reason, "run-record-unavailable")
+
+            if symlink_supported:
+                symlink_run.unlink()
+            ci_smoke.write_json(
+                symlink_run, {"run_id": run_id, "command": "agent-replay", "status": "passed"}
+            )
+            try:
+                (symlink_run.parent / "result.json").symlink_to(outside)
+            except (NotImplementedError, OSError):
+                symlink_supported = False
+            else:
+                symlink_supported = True
+            if symlink_supported:
+                with self.assertRaises(ci_smoke.AgentReplaySelectionError) as caught:
+                    ci_smoke.select_new_agent_replay_record(evidence, set())
+                self.assertEqual(caught.exception.reason, "result-record-unavailable")
+
+            if symlink_supported:
+                (symlink_run.parent / "result.json").unlink()
+            (symlink_run.parent / "result.json").write_text("{}\n", encoding="utf-8")
+            symlink_run.write_text(json.dumps({"command": "agent-replay"}) + " " * 65537)
+            with self.assertRaises(ci_smoke.AgentReplaySelectionError) as caught:
+                ci_smoke.select_new_agent_replay_record(evidence, set())
+            self.assertEqual(caught.exception.reason, "run-record-unavailable")
+
+            symlink_run.write_text(
+                json.dumps({"run_id": run_id, "command": "agent-replay"}), encoding="utf-8"
+            )
+            linked_dir = evidence / "runs" / str(uuid.uuid4())
+            linked_dir.symlink_to(symlink_run.parent, target_is_directory=True)
+            with self.assertRaises(ci_smoke.AgentReplaySelectionError) as caught:
+                ci_smoke.select_new_agent_replay_record(evidence, set())
+            self.assertEqual(caught.exception.reason, "run-record-unavailable")
+
+    def test_top_level_recorder_uses_every_parsed_subcommand(self):
+        shop = self.module()
+        import ci_smoke
+
+        parser = shop.build_parser()
+        subcommands = next(action.choices for action in parser._actions if action.dest == "command")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            evidence = root / "evidence"
+            for command in subcommands:
+                with self.subTest(command=command):
+
+                    def dispatch(argv, runner, http, parsed_args=None):
+                        self.assertEqual(parsed_args.command, command)
+                        return 0
+
+                    with mock.patch.object(shop, "dispatch_main", side_effect=dispatch):
+                        before = set(evidence.glob("runs/*/run.json"))
+                        shop.main(
+                            [
+                                "--no-browser",
+                                "--state-dir",
+                                str(state),
+                                "--evidence-dir",
+                                str(evidence),
+                                command,
+                            ]
+                        )
+                    records = set(evidence.glob("runs/*/run.json")) - before
+                    self.assertEqual(len(records), 1)
+                    self.assertEqual(ci_smoke.read_json(records.pop())["command"], command)
+
+            before = set(evidence.glob("runs/*/run.json"))
+            with mock.patch.object(shop, "dispatch_main", return_value=0):
+                shop.main(
+                    [
+                        "--no-browser",
+                        "--state-dir",
+                        str(root / "agent-replay"),
+                        "--evidence-dir",
+                        str(evidence),
+                        "start",
+                    ]
+                )
+            new_records = set(evidence.glob("runs/*/run.json")) - before
+            self.assertEqual(len(new_records), 1)
+            self.assertEqual(ci_smoke.read_json(new_records.pop())["command"], "start")
+
+    def test_campaign_reports_agent_failure_from_the_real_top_level_record(self):
+        shop = self.module()
+        import ci_smoke
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            evidence = root / "evidence"
+            state.mkdir()
+            evidence.mkdir()
+            ci_smoke.write_json(state / "state.json", {"agent_replay_enabled": True})
+            campaign = ci_smoke.Campaign(state, evidence)
+            secret = "synthetic private prompt sentinel"
+
+            def dispatch(argv, runner, http, parsed_args=None):
+                shop._RECORDER.result(
+                    {
+                        "failure_stage": "fixture-endpoint",
+                        "endpoint_check": "http-readiness",
+                        "error_type": "TimeoutError",
+                        "prompt": secret,
+                    }
+                )
+                return 1
+
+            def subprocess_run(argv, **kwargs):
+                return_code = shop.main(argv[2:])
+                return types.SimpleNamespace(returncode=return_code)
+
+            with (
+                mock.patch.object(shop, "dispatch_main", side_effect=dispatch),
+                mock.patch.object(ci_smoke.subprocess, "run", side_effect=subprocess_run),
+                self.assertRaisesRegex(RuntimeError, "Shop step failed: agent-replay"),
+            ):
+                campaign.cli("agent-replay")
+
+            error_summary = campaign._new_failed_run_summary(set(), "agent-replay")
+            self.assertIn('"failure_stage":"fixture-endpoint"', error_summary)
+            self.assertIn('"endpoint_check":"http-readiness"', error_summary)
+            self.assertNotIn(secret, error_summary)
+
+    def test_failed_agent_endpoint_readiness_does_not_send_prompt(self):
+        shop = self.module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = "shop-0123456789ab"
+            overlay = shop.AGENT_REPLAY_OVERLAY.resolve()
+            cassette = root / shop.AGENT_REPLAY_CASSETTE
+            cassette.write_text("synthetic cassette placeholder\n", encoding="utf-8")
+            config_path = root / "compose.json"
+            fixtures = root / "fixtures"
+            fixtures.mkdir()
+            config = {
+                "networks": {"agent-replay": {"internal": True}},
+                "services": {
+                    "agent": {
+                        "networks": {"agent-replay": None},
+                        "volumes": [
+                            {
+                                "target": "/app/sitecustomize.py",
+                                "source": str(overlay),
+                                "read_only": True,
+                            }
+                        ],
+                        "environment": {
+                            "LLM_BASE_URL": "http://127.0.0.1:9/v1",
+                            "API_KEY": "sk-dummy",
+                            "OPENAI_API_KEY": "sk-dummy",
+                        },
+                    }
+                },
+            }
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            state = {
+                "agent_replay_enabled": True,
+                "started": True,
+                "project": project,
+                "docker_context": "captured-engine",
+                "config": str(config_path),
+                "source_commit": shop.SOURCE_COMMIT,
+                "agent_replay_overlay": str(overlay),
+                "agent_replay_cassette": str(cassette),
+            }
+            container_id = "a" * 64
+            runner_calls = []
+
+            def runner(argv):
+                runner_calls.append(argv)
+                if argv[:3] == ["docker", "--context", "captured-engine"] and "inspect" in argv:
+                    if "{{json .Mounts}}" in argv:
+                        return json.dumps(
+                            [
+                                {
+                                    "Destination": "/app/sitecustomize.py",
+                                    "Source": str(overlay),
+                                    "RW": False,
+                                },
+                                {"Destination": "/app/fixtures", "Source": str(fixtures), "RW": False},
+                            ]
+                        )
+                    if "{{json .HostConfig.PortBindings}}" in argv:
+                        return "{}"
+                    if "{{json .NetworkSettings.Networks}}" in argv:
+                        return json.dumps({project + "_agent-replay": {}})
+                    if "{{.State.Running}}" in argv:
+                        return "false"
+                if "network" in argv and "inspect" in argv:
+                    return "true"
+                if "ps" in argv and "--quiet" in argv:
+                    return container_id
+                if "exec" in argv and "python" in argv:
+                    script = argv[-1]
+                    if "VCR.record_mode.value" in script:
+                        return json.dumps(
+                            {
+                                "status": "PASS",
+                                "vcrpy": shop.AGENT_VCRPY_VERSION,
+                                "record_mode": "none",
+                                "overlay_sha256": hashlib.sha256(overlay.read_bytes()).hexdigest(),
+                            }
+                        )
+                    if "openapi.json" in script:
+                        return json.dumps(
+                            {
+                                "status": "UNKNOWN",
+                                "failed_check": "http-readiness",
+                                "error_type": "TimeoutError",
+                            }
+                        )
+                    if "urllib.request.Request(" in script:
+                        raise AssertionError("Prompt POST ran before readiness succeeded.")
+                return ""
+
+            with mock.patch.object(shop, "verify_world", return_value={}):
+                with self.assertRaisesRegex(RuntimeError, "no external model call"):
+                    shop.run_agent_replay(state, root, runner=runner)
+
+            self.assertFalse(any("urllib.request.Request(" in argv[-1] for argv in runner_calls))
+            result = json.loads((root / "agent-replay-result.json").read_bytes())
+            self.assertEqual(result["failure_stage"], "fixture-endpoint")
+            self.assertEqual(result["endpoint_check"], "http-readiness")
+            self.assertTrue(result["agent_stopped"])
+            self.assertNotIn("tool_names", result)
 
     def test_stop_is_exact_project_and_preserves_data(self):
         shop = self.module()

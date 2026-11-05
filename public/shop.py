@@ -2292,7 +2292,8 @@ def fresh_world_setup_args(base, state, selected):
     return setup_args
 
 
-def dispatch_main(argv=None, runner=native, http=request):
+def build_parser():
+    """Build the single authoritative command parser used by dispatch and evidence."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, default=PUBLIC.parent / ".shop")
     parser.add_argument("--evidence-dir", type=Path)
@@ -2328,7 +2329,11 @@ def dispatch_main(argv=None, runner=native, http=request):
         command.add_argument("--user-id")
         if name == "replay":
             command.add_argument("--fixture", type=Path)
-    args = parser.parse_args(argv)
+    return parser
+
+
+def dispatch_main(argv=None, runner=native, http=request, parsed_args=None):
+    args = parsed_args if parsed_args is not None else build_parser().parse_args(argv)
     base = args.state_dir.absolute()
     if args.command == "cases":
         for name, story in STORIES.items():
@@ -2608,37 +2613,34 @@ def main(argv=None, runner=native, http=request):
     if outer:
         from evidence import EvidenceRecorder
 
-        pre = argparse.ArgumentParser(add_help=False)
-        pre.add_argument("--state-dir", type=Path, default=PUBLIC.parent / ".shop")
-        pre.add_argument("--evidence-dir", type=Path)
-        pre.add_argument("--no-browser", action="store_true")
-        known, _ = pre.parse_known_args(actual)
+        parsed_args = build_parser().parse_args(actual)
         saved = {}
         try:
-            saved = json.loads((active_directory(known.state_dir.absolute()) / "state.json").read_bytes())
+            saved = json.loads(
+                (active_directory(parsed_args.state_dir.absolute()) / "state.json").read_bytes()
+            )
         except (OSError, ValueError):
             pass
-        folder = known.evidence_dir or Path(saved.get("evidence_root", PUBLIC.parent / "evidence"))
-        story = next((x for x in actual if x in STORIES), saved.get("story", "normal-checkout"))
-        command = next(
-            (
-                x
-                for x in actual
-                if x in ("setup", "start", "story", "reset", "replay", "stop", "clean", "view", "cases")
-            ),
-            "help",
-        )
+        folder = parsed_args.evidence_dir or Path(saved.get("evidence_root", PUBLIC.parent / "evidence"))
+        story = getattr(parsed_args, "story", None) or getattr(parsed_args, "name", None)
+        story = story or saved.get("story", "normal-checkout")
+        if story == "normal":
+            story = "normal-checkout"
+        command = parsed_args.command or "help"
         _RECORDER = EvidenceRecorder(
             folder,
             command,
             STORIES.get(story, {}).get("title", story),
-            open_browser=not known.no_browser and not os.environ.get("CI") and command != "cases",
+            open_browser=not parsed_args.no_browser and not os.environ.get("CI") and command != "cases",
         )
         fixture = synthetic_fixture()
         _RECORDER.set_redactions([fixture["email"], fixture["creditCard"]["creditCardNumber"]])
         _RECORDER.phase("Starting " + command + ". Evidence is stored on the host, outside Docker.")
     try:
-        result = dispatch_main(actual, runner, http)
+        if outer:
+            result = dispatch_main(actual, runner, http, parsed_args=parsed_args)
+        else:
+            result = dispatch_main(actual, runner, http)
         if outer:
             _RECORDER.finish("passed" if result == 0 else "failed")
         return result

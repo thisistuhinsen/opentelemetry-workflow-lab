@@ -738,6 +738,68 @@ def run_agent_replay_command(campaign):
     return prior_runs
 
 
+class AgentReplaySelectionError(RuntimeError):
+    """A bounded reason why new replay evidence could not be selected safely."""
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__("Agent replay evidence selection is UNKNOWN.")
+
+
+def read_contained_evidence_json(evidence, path):
+    """Read one bounded JSON object only when its file resolves inside evidence."""
+    root = Path(evidence).resolve()
+    path = Path(path).absolute()
+    try:
+        relative = path.relative_to(root)
+        current = root
+        for component in relative.parts[:-1]:
+            current = current / component
+            if current.is_symlink():
+                return None
+        if path.is_symlink() or not path.resolve().is_relative_to(root) or not path.is_file():
+            return None
+        if path.stat().st_size > 65536:
+            return None
+        value = read_json(path)
+    except (OSError, ValueError, RuntimeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def select_new_agent_replay_record(evidence, prior_runs):
+    """Select exactly one fresh replay run and its contained sibling result."""
+    root = Path(evidence).resolve()
+    runs = root / "runs"
+    if runs.is_symlink() or not runs.is_dir() or not runs.resolve().is_relative_to(root):
+        raise AgentReplaySelectionError("run-record-count")
+    fresh = sorted(set(runs.glob("*/run.json")) - prior_runs)
+    prior_run_ids = {Path(path).parent.name for path in prior_runs}
+    matches = []
+    for path in fresh:
+        run = read_contained_evidence_json(root, path)
+        if run is None:
+            raise AgentReplaySelectionError("run-record-unavailable")
+        run_id = run.get("run_id")
+        if (
+            not isinstance(run_id, str)
+            or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", run_id)
+            or path.parent.is_symlink()
+            or path.parent.name != run_id
+            or run_id in prior_run_ids
+        ):
+            raise AgentReplaySelectionError("run-record-identity")
+        if run.get("command") == "agent-replay":
+            matches.append((path, run))
+    if len(matches) != 1:
+        raise AgentReplaySelectionError("run-record-count")
+    run_path, run = matches[0]
+    result = read_contained_evidence_json(root, run_path.parent / "result.json")
+    if result is None:
+        raise AgentReplaySelectionError("result-record-unavailable")
+    return run_path, run, result
+
+
 def assert_fresh(before, after, context, *, empty=False):
     if before["project"] == after["project"] or after["docker_context"] != context:
         raise RuntimeError("Reset/replay did not preserve context and create a fresh shop.")
@@ -1003,6 +1065,14 @@ def campaign_failure_diagnostic(summary, phase):
             agent_detail["agent_stopped"] = agent["agent_stopped"]
         if agent_detail:
             diagnostic["agent_replay_diagnostic"] = agent_detail
+        selection_failure = agent.get("selection_failure")
+        if isinstance(selection_failure, str) and selection_failure in {
+            "run-record-count",
+            "run-record-unavailable",
+            "run-record-identity",
+            "result-record-unavailable",
+        }:
+            diagnostic.setdefault("agent_replay_diagnostic", {})["selection_failure"] = selection_failure
     return diagnostic
 
 
@@ -2781,16 +2851,9 @@ def main(argv=None):
             agent_replay_prior_runs = set((campaign.evidence / "runs").glob("*/run.json"))
             try:
                 prior_runs = run_agent_replay_command(campaign)
-                new_runs = {
-                    path
-                    for path in set((campaign.evidence / "runs").glob("*/run.json")) - prior_runs
-                    if read_json(path).get("command") == "agent-replay"
-                }
-                if len(new_runs) != 1:
-                    raise RuntimeError("The agent fixture replay did not produce one durable command result.")
-                run_path = new_runs.pop()
-                agent_run = read_json(run_path)
-                agent_result = read_json(run_path.parent / "result.json")
+                run_path, agent_run, agent_result = select_new_agent_replay_record(
+                    campaign.evidence, prior_runs
+                )
                 if not validate_agent_replay_result(
                     agent_run,
                     agent_result,
@@ -2816,10 +2879,11 @@ def main(argv=None):
                     "live_inference": False,
                 }
                 agent_replay_succeeded = True
-            except Exception:
-                summary["agent_replay"] = agent_replay_failure_diagnostic(
-                    campaign.evidence, agent_replay_prior_runs
-                )
+            except Exception as error:
+                agent_failure = agent_replay_failure_diagnostic(campaign.evidence, agent_replay_prior_runs)
+                if isinstance(error, AgentReplaySelectionError):
+                    agent_failure["selection_failure"] = error.reason
+                summary["agent_replay"] = agent_failure
                 agent_replay_succeeded = False
                 write_json(campaign.receipts / "campaign.json", summary)
                 raise RuntimeError("Agent fixture replay is UNKNOWN; no external call was allowed.")
